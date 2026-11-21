@@ -3,6 +3,9 @@ name = "notifications-1mb"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+rustix = { version = "1", default-features = false, features = ["net", "event", "stdio"] }
+
 [profile.dev]
 panic = "abort"
 
