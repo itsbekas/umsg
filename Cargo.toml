@@ -1,5 +1,5 @@
 [package]
-name = "notifications-1mb"
+name = "umsg"
 version = "0.1.0"
 edition = "2024"
 

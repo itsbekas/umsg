@@ -1,0 +1,36 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/itsbekas/umsg:latest
+
+  deploy:
+    needs: build
+    uses: itsbekas/homelab/.github/workflows/trigger-watchtower.yml@master
+    with:
+      image: ghcr.io/itsbekas/umsg
+    secrets:
+      url: ${{ secrets.WATCHTOWER_URL }}
+      token: ${{ secrets.WATCHTOWER_TOKEN }}
