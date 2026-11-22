@@ -29,6 +29,9 @@ const MAX_CLIENTS: usize = 16;
 const READ_BUF_SIZE: usize = 1024;
 const JSON_BUF_SIZE: usize = 512;
 
+/// Embedded directly in `.rodata` — 1 memory page (4 KB), only paged in when requested.
+const INDEX_HTML: &[u8] = include_bytes!("index.html");
+
 const LISTENER_TAG: u64 = u64::MAX;
 
 struct Client {
@@ -224,6 +227,7 @@ fn handle_client_read(
     let mut json_buf = [0u8; JSON_BUF_SIZE];
     let mut broadcast_len: usize = 0;
     let mut broadcast_id: u64 = 0;
+    let mut last_event_id: u64 = 0;
 
     let action = {
         let data = &clients[slot].read_buf[..clients[slot].read_len];
@@ -231,7 +235,10 @@ fn handle_client_read(
             ParseStatus::Incomplete => return,
             ParseStatus::Invalid => 0u8, // close
             ParseStatus::Complete(req) => match (req.method, req.path) {
-                (Method::Get, b"/events") => 1u8,
+                (Method::Get, b"/events") => {
+                    last_event_id = req.last_event_id;
+                    1u8
+                }
                 (Method::Post, path) => {
                     let topic = path.strip_prefix(b"/").unwrap_or(path);
                     let topic = if topic.is_empty() { b"default" } else { topic };
@@ -243,14 +250,15 @@ fn handle_client_read(
                     broadcast_len = notif.format_json(topic_name, &mut json_buf);
                     2u8
                 }
-                _ => 3u8,
+                (Method::Get, b"/") => 3u8,
+                _ => 4u8,
             },
         }
     };
 
     match action {
         1 => {
-            // Upgrade connection to live SSE stream and replay recent history
+            // Upgrade connection to live SSE stream and replay missed history
             let sse_headers = b"HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Cache-Control: no-cache\r\n\
@@ -264,7 +272,7 @@ fn handle_client_read(
             if ok {
                 let fd = clients[slot].fd.as_ref().unwrap();
                 store.for_each_oldest_first(|notif, topic_name| {
-                    if ok {
+                    if ok && notif.id > last_event_id {
                         ok = send_sse_event(fd, notif, topic_name, &mut json_buf);
                     }
                 });
@@ -288,6 +296,13 @@ fn handle_client_read(
             broadcast_sse_json(epfd, clients, broadcast_id, &json_buf[..broadcast_len]);
         }
         3 => {
+            // Serve the embedded web UI
+            if let Some(fd) = clients[slot].fd.as_ref() {
+                send_http_response(fd, b"text/html; charset=utf-8", INDEX_HTML);
+            }
+            close_client(epfd, &mut clients[slot]);
+        }
+        4 => {
             if let Some(fd) = clients[slot].fd.as_ref() {
                 send_http_response(fd, b"text/plain", b"ok\n");
             }

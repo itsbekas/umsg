@@ -15,6 +15,7 @@ pub struct Request<'a> {
     pub path: &'a [u8],
     pub title: &'a [u8],
     pub priority: u8, // 1=min, 2=low, 3=default, 4=high, 5=urgent
+    pub last_event_id: u64,
     pub body: &'a [u8],
 }
 
@@ -57,6 +58,7 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
     let mut content_length: usize = 0;
     let mut title: &[u8] = b"";
     let mut priority: u8 = 3;
+    let mut last_event_id: u64 = 0;
 
     let mut pos = first_line_end;
     while pos + 2 <= head.len() {
@@ -81,6 +83,10 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
                 || eq_ignore_ascii_case(name, b"x-priority")
             {
                 priority = parse_priority(val);
+            } else if eq_ignore_ascii_case(name, b"last-event-id") {
+                if let Some(n) = parse_usize(val) {
+                    last_event_id = n as u64;
+                }
             }
         }
 
@@ -103,6 +109,7 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
         path,
         title,
         priority,
+        last_event_id,
         body,
     })
 }
