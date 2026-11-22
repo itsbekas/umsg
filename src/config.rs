@@ -17,11 +17,12 @@ pub const DEFAULT_KEEPALIVE_SECS: i64 = 30;
 /// Maximum simultaneous TCP connections (browsers + incoming POSTs).
 pub const MAX_CLIENTS: usize = 16;
 
-/// Per-client HTTP read buffer size in bytes.
-pub const READ_BUF_SIZE: usize = 1024;
+/// Per-client HTTP read buffer size in bytes (4 KB handles Cloudflare Access headers).
+pub const READ_BUF_SIZE: usize = 4096;
 
-/// Temporary stack buffer size for formatting one JSON notification.
-pub const JSON_BUF_SIZE: usize = 512;
+/// Temporary stack buffer size for formatting one JSON notification
+/// (worst-case 2x escaped payload = 448 B + ~100 B JSON overhead < 640 B).
+pub const JSON_BUF_SIZE: usize = 640;
 
 /// Number of recent notifications kept in the in-memory ring buffer.
 pub const MAX_HISTORY: usize = 64;

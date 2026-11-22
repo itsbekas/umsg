@@ -30,7 +30,7 @@ use disk::DiskLog;
 use env::Env;
 use fmt::BufWriter;
 use http::{Method, ParseStatus, parse_request};
-use store::{Notification, Store};
+use store::{Notification, Store, is_valid_topic};
 
 /// Embedded directly in `.rodata` — 1 memory page (4 KB), only paged in when requested.
 const INDEX_HTML: &[u8] = include_bytes!("index.html");
@@ -269,7 +269,7 @@ fn handle_client_read(
         let data = &clients[slot].read_buf[..clients[slot].read_len];
         match parse_request(data) {
             ParseStatus::Incomplete => return,
-            ParseStatus::Invalid => 0u8, // close
+            ParseStatus::Invalid => 5u8, // 400 Bad Request
             ParseStatus::Complete(req) => match (req.method, req.path) {
                 (Method::Get, b"/") => 3u8,
                 (Method::Get, b"/health") => 4u8,
@@ -281,27 +281,38 @@ fn handle_client_read(
                 }
                 (Method::Get, path) => {
                     let topic = path.strip_prefix(b"/").unwrap_or(path);
-                    if topic.is_empty() {
-                        3u8
-                    } else {
-                        sub_topic = Some(store.intern_topic(topic));
-                        replay_history = false; // live-only (safe for 2FA tokens!)
+                    if !is_valid_topic(topic) {
+                        6u8 // 404 Not Found (e.g. /favicon.ico, invalid chars)
+                    } else if let Some(tid) = store.intern_topic(topic) {
+                        sub_topic = Some(tid);
+                        replay_history = false; // live-only (safe for ephemeral tokens)
                         1u8
+                    } else {
+                        7u8 // 507 Insufficient Storage (topic table full)
                     }
                 }
                 (Method::Post, path) => {
                     let topic = path.strip_prefix(b"/").unwrap_or(path);
                     let topic = if topic.is_empty() { b"default" } else { topic };
-                    let ts = clock_gettime(ClockId::Realtime).tv_sec;
-                    let notif = *store.push(ts, topic, req.title, req.priority, req.body);
-                    let topic_name = store.topic_name(notif.topic_id);
-                    disk.append(&notif, topic_name);
-                    broadcast_id = notif.id;
-                    broadcast_topic_id = notif.topic_id;
-                    broadcast_len = notif.format_json(topic_name, &mut json_buf);
-                    2u8
+                    if !is_valid_topic(topic) {
+                        5u8 // 400 Bad Request
+                    } else {
+                        let ts = clock_gettime(ClockId::Realtime).tv_sec;
+                        if let Some(notif) =
+                            store.push(ts, topic, req.title, req.priority, req.body).copied()
+                        {
+                            let topic_name = store.topic_name(notif.topic_id);
+                            disk.append(&notif, topic_name);
+                            broadcast_id = notif.id;
+                            broadcast_topic_id = notif.topic_id;
+                            broadcast_len = notif.format_json(topic_name, &mut json_buf);
+                            2u8
+                        } else {
+                            7u8 // 507 Insufficient Storage
+                        }
+                    }
                 }
-                _ => 4u8,
+                _ => 6u8, // 404 Not Found
             },
         }
     };
@@ -312,6 +323,7 @@ fn handle_client_read(
             let sse_headers = b"HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Cache-Control: no-cache\r\n\
+                X-Content-Type-Options: nosniff\r\n\
                 Connection: keep-alive\r\n\r\n";
 
             let mut ok = clients[slot]
@@ -339,7 +351,12 @@ fn handle_client_read(
         2 => {
             // Reply to POST sender with the stored JSON notification
             if let Some(fd) = clients[slot].fd.as_ref() {
-                send_http_response(fd, b"application/json", &json_buf[..broadcast_len]);
+                send_http_status(
+                    fd,
+                    b"200 OK",
+                    b"application/json",
+                    &json_buf[..broadcast_len],
+                );
             }
             close_client(epfd, &mut clients[slot]);
 
@@ -355,13 +372,36 @@ fn handle_client_read(
         3 => {
             // Serve the embedded web UI
             if let Some(fd) = clients[slot].fd.as_ref() {
-                send_http_response(fd, b"text/html; charset=utf-8", INDEX_HTML);
+                send_http_status(fd, b"200 OK", b"text/html; charset=utf-8", INDEX_HTML);
             }
             close_client(epfd, &mut clients[slot]);
         }
         4 => {
             if let Some(fd) = clients[slot].fd.as_ref() {
-                send_http_response(fd, b"text/plain", b"ok\n");
+                send_http_status(fd, b"200 OK", b"text/plain", b"ok\n");
+            }
+            close_client(epfd, &mut clients[slot]);
+        }
+        5 => {
+            if let Some(fd) = clients[slot].fd.as_ref() {
+                send_http_status(fd, b"400 Bad Request", b"text/plain", b"bad request\n");
+            }
+            close_client(epfd, &mut clients[slot]);
+        }
+        6 => {
+            if let Some(fd) = clients[slot].fd.as_ref() {
+                send_http_status(fd, b"404 Not Found", b"text/plain", b"not found\n");
+            }
+            close_client(epfd, &mut clients[slot]);
+        }
+        7 => {
+            if let Some(fd) = clients[slot].fd.as_ref() {
+                send_http_status(
+                    fd,
+                    b"507 Insufficient Storage",
+                    b"text/plain",
+                    b"topic limit reached\n",
+                );
             }
             close_client(epfd, &mut clients[slot]);
         }
@@ -369,10 +409,12 @@ fn handle_client_read(
     }
 }
 
-fn send_http_response(fd: impl AsFd, content_type: &[u8], body: &[u8]) {
+fn send_http_status(fd: impl AsFd, status: &[u8], content_type: &[u8], body: &[u8]) {
     let mut hdr = [0u8; 384];
     let mut w = BufWriter::new(&mut hdr);
-    w.push_bytes(b"HTTP/1.1 200 OK\r\nContent-Type: ");
+    w.push_bytes(b"HTTP/1.1 ");
+    w.push_bytes(status);
+    w.push_bytes(b"\r\nContent-Type: ");
     w.push_bytes(content_type);
     w.push_bytes(b"\r\nContent-Length: ");
     w.push_u64(body.len() as u64);

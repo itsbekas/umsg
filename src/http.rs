@@ -52,10 +52,14 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
         b"POST" => Method::Post,
         _ => Method::Other,
     };
-    let path = &rest[..sp2];
+    let raw_path = &rest[..sp2];
+    let path = match find_byte(raw_path, b'?') {
+        Some(q) => &raw_path[..q],
+        None => raw_path,
+    };
 
     // Scan headers without allocating
-    let mut content_length: usize = 0;
+    let mut content_length: Option<usize> = None;
     let mut title: &[u8] = b"";
     let mut priority: u8 = 3;
     let mut last_event_id: u64 = 0;
@@ -73,9 +77,16 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
             let val = trim_ascii(&line[colon + 1..]);
 
             if eq_ignore_ascii_case(name, b"content-length") {
-                if let Some(n) = parse_usize(val) {
-                    content_length = n;
+                // Reject duplicate or malformed Content-Length (request smuggling protection)
+                if content_length.is_some() {
+                    return ParseStatus::Invalid;
                 }
+                let Some(n) = parse_usize(val) else {
+                    return ParseStatus::Invalid;
+                };
+                content_length = Some(n);
+            } else if eq_ignore_ascii_case(name, b"transfer-encoding") {
+                return ParseStatus::Invalid;
             } else if eq_ignore_ascii_case(name, b"title") || eq_ignore_ascii_case(name, b"x-title")
             {
                 title = val;
@@ -93,16 +104,13 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
         pos = line_end;
     }
 
+    let expected_len = content_length.unwrap_or(0);
     let available_body = buf.len() - body_start;
-    if available_body < content_length {
+    if available_body < expected_len {
         return ParseStatus::Incomplete;
     }
 
-    let body = if content_length > 0 {
-        &buf[body_start..body_start + content_length]
-    } else {
-        &buf[body_start..]
-    };
+    let body = &buf[body_start..body_start + expected_len];
 
     ParseStatus::Complete(Request {
         method,

@@ -59,7 +59,7 @@ impl<'a> BufWriter<'a> {
                 b'\n' => self.push_bytes(b"\\n"),
                 b'\r' => self.push_bytes(b"\\r"),
                 b'\t' => self.push_bytes(b"\\t"),
-                0x00..=0x1f => {} // strip other control bytes
+                0x00..=0x1f | 0x7f => {} // strip other control bytes
                 _ => self.push_byte(b),
             }
         }

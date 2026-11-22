@@ -86,6 +86,32 @@ pub struct Store {
     count: usize,
 }
 
+/// Returns true if `name` is a safe topic identifier (`1..=MAX_TOPIC` of `[a-zA-Z0-9_-]`).
+pub fn is_valid_topic(name: &[u8]) -> bool {
+    if name.is_empty() || name.len() > MAX_TOPIC {
+        return false;
+    }
+    for &b in name {
+        if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Truncates `s` to at most `max` bytes without splitting a multi-byte UTF-8 sequence.
+fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
+    if s.len() <= max {
+        return s;
+    }
+    let mut len = max;
+    // UTF-8 continuation bytes have bit pattern 10xxxxxx (0x80..=0xBF)
+    while len > 0 && (s[len] & 0b1100_0000) == 0b1000_0000 {
+        len -= 1;
+    }
+    &s[..len]
+}
+
 impl Store {
     /// All-zero initializer so the entire store lives in `.bss`
     /// (0 bytes on disk, lazy-paged in RAM!).
@@ -99,25 +125,24 @@ impl Store {
     };
 
     /// Returns the 1-byte ID for `name`, inserting it into the topic table if new.
-    pub fn intern_topic(&mut self, name: &[u8]) -> u8 {
-        let len = name.len().min(MAX_TOPIC);
-        let trimmed = &name[..len];
+    /// Returns `None` if the topic table is full (never aliases to slot 0).
+    pub fn intern_topic(&mut self, name: &[u8]) -> Option<u8> {
+        let trimmed = truncate_utf8(name, MAX_TOPIC);
 
         for i in 0..self.topic_count {
             if self.topics[i].as_bytes() == trimmed {
-                return i as u8;
+                return Some(i as u8);
             }
         }
 
         if self.topic_count < MAX_TOPICS {
             let id = self.topic_count;
-            self.topics[id].name[..len].copy_from_slice(trimmed);
-            self.topics[id].len = len as u8;
+            self.topics[id].name[..trimmed.len()].copy_from_slice(trimmed);
+            self.topics[id].len = trimmed.len() as u8;
             self.topic_count += 1;
-            id as u8
+            Some(id as u8)
         } else {
-            // Table full: reuse slot 0 rather than failing
-            0
+            None
         }
     }
 
@@ -137,8 +162,8 @@ impl Store {
         title: &[u8],
         priority: u8,
         body: &[u8],
-    ) -> &Notification {
-        let topic_id = self.intern_topic(topic);
+    ) -> Option<&Notification> {
+        let topic_id = self.intern_topic(topic)?;
         let idx = self.head;
         let n = &mut self.entries[idx];
 
@@ -148,20 +173,20 @@ impl Store {
         n.priority = priority;
         n.topic_id = topic_id;
 
-        let ttlen = title.len().min(MAX_TITLE);
-        n.title[..ttlen].copy_from_slice(&title[..ttlen]);
-        n.title_len = ttlen as u8;
+        let title = truncate_utf8(title, MAX_TITLE);
+        n.title[..title.len()].copy_from_slice(title);
+        n.title_len = title.len() as u8;
 
-        let blen = body.len().min(MAX_BODY);
-        n.body[..blen].copy_from_slice(&body[..blen]);
-        n.body_len = blen as u8;
+        let body = truncate_utf8(body, MAX_BODY);
+        n.body[..body.len()].copy_from_slice(body);
+        n.body_len = body.len() as u8;
 
         self.head = (self.head + 1) % MAX_HISTORY;
         if self.count < MAX_HISTORY {
             self.count += 1;
         }
 
-        &self.entries[idx]
+        Some(&self.entries[idx])
     }
 
     /// Calls `f` for each stored notification (with its resolved topic name), oldest to newest.
