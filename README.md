@@ -29,7 +29,7 @@ Supported headers on `POST`:
 - `Title` / `X-Title` — optional title (max `64` bytes)
 - `Priority` / `X-Priority` — `1`/`min`, `2`/`low`, `3`/`default`, `4`/`high`, `5`/`urgent`/`max`
 - `Ephemeral` / `X-Ephemeral` — `1`/`true`: broadcast live to `/<topic>` subscribers **only** (never persisted to RAM history, disk, or `/all`)
-- `Authorization: Bearer <token>` — required on `POST` if `AUTH_TOKEN` is set
+- `Authorization: Bearer <token>` — required on all endpoints except `GET /health` if `AUTH_TOKEN` is set
 - Body — message text (max `128` bytes)
 
 Subscribe live to a single topic:
@@ -43,7 +43,7 @@ curl -N http://localhost:8080/backups
 - `PORT` — TCP port to bind on `0.0.0.0` (default: `8080`)
 - `LOG_PATH` — path to the append-only binary log (default: `notifications.log`; `/data/notifications.log` in Docker)
 - `KEEPALIVE_SECS` — SSE `: ping` interval in seconds, clamped `1..=3600` (default: `30`)
-- `AUTH_TOKEN` — optional Bearer token required on `POST` requests (unset = no auth)
+- `AUTH_TOKEN` — optional Bearer token required on all endpoints except `GET /health` (unset = no auth)
 
 **Compile-time capacities** live in [src/config.rs](src/config.rs) (`MAX_CLIENTS`, `MAX_HISTORY`, `MAX_TOPICS`, `MAX_TOPIC`, `MAX_TITLE`, `MAX_BODY`).
 

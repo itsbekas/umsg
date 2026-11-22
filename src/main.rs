@@ -303,51 +303,17 @@ fn handle_client_read(
         match parse_request(data) {
             ParseStatus::Incomplete => return,
             ParseStatus::Invalid => 5u8, // 400 Bad Request
-            ParseStatus::Complete(req) => match (req.method, req.path) {
-                (Method::Get, b"/") => 3u8,
-                (Method::Get, b"/health") => 4u8,
-                (Method::Get, b"/all") => {
-                    last_event_id = req.last_event_id;
-                    topic_len = 0;
-                    replay_history = true;
-                    1u8
-                }
-                (Method::Get, path) => {
-                    let topic = path.strip_prefix(b"/").unwrap_or(path);
-                    if !is_valid_topic(topic) {
-                        6u8 // 404 Not Found (e.g. /favicon.ico, invalid chars)
+            ParseStatus::Complete(req) => {
+                if matches!((req.method, req.path), (Method::Get, b"/health")) {
+                    4u8
+                } else if let Some(expected) = auth_token {
+                    let supplied = req.auth.strip_prefix(b"Bearer ").unwrap_or(b"");
+                    if !const_time_eq(supplied, expected) {
+                        8u8 // 401 Unauthorized
                     } else {
-                        // Store topic name without touching Store's topic table!
-                        topic_buf[..topic.len()].copy_from_slice(topic);
-                        topic_len = topic.len();
-                        replay_history = false; // live-only (safe for ephemeral tokens)
-                        1u8
-                    }
-                }
-                (Method::Post, path) => {
-                    if let Some(expected) = auth_token {
-                        let supplied = req.auth.strip_prefix(b"Bearer ").unwrap_or(b"");
-                        if !const_time_eq(supplied, expected) {
-                            8u8 // 401 Unauthorized
-                        } else {
-                            handle_post(
-                                store,
-                                disk,
-                                path,
-                                &req,
-                                &mut json_buf,
-                                &mut broadcast_id,
-                                &mut topic_buf,
-                                &mut topic_len,
-                                &mut broadcast_len,
-                                &mut broadcast_topic_only,
-                            )
-                        }
-                    } else {
-                        handle_post(
+                        route_authorized(
                             store,
                             disk,
-                            path,
                             &req,
                             &mut json_buf,
                             &mut broadcast_id,
@@ -355,11 +321,26 @@ fn handle_client_read(
                             &mut topic_len,
                             &mut broadcast_len,
                             &mut broadcast_topic_only,
+                            &mut replay_history,
+                            &mut last_event_id,
                         )
                     }
+                } else {
+                    route_authorized(
+                        store,
+                        disk,
+                        &req,
+                        &mut json_buf,
+                        &mut broadcast_id,
+                        &mut topic_buf,
+                        &mut topic_len,
+                        &mut broadcast_len,
+                        &mut broadcast_topic_only,
+                        &mut replay_history,
+                        &mut last_event_id,
+                    )
                 }
-                _ => 6u8, // 404 Not Found
-            },
+            }
         }
     };
 
@@ -462,6 +443,55 @@ fn handle_client_read(
             close_client(epfd, &mut clients[slot]);
         }
         _ => close_client(epfd, &mut clients[slot]),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_authorized(
+    store: &mut Store,
+    disk: &DiskLog,
+    req: &http::Request<'_>,
+    json_buf: &mut [u8; JSON_BUF_SIZE],
+    broadcast_id: &mut u64,
+    topic_buf: &mut [u8; MAX_TOPIC],
+    topic_len: &mut usize,
+    broadcast_len: &mut usize,
+    broadcast_topic_only: &mut bool,
+    replay_history: &mut bool,
+    last_event_id: &mut u64,
+) -> u8 {
+    match (req.method, req.path) {
+        (Method::Get, b"/") => 3,
+        (Method::Get, b"/all") => {
+            *last_event_id = req.last_event_id;
+            *topic_len = 0;
+            *replay_history = true;
+            1
+        }
+        (Method::Get, path) => {
+            let topic = path.strip_prefix(b"/").unwrap_or(path);
+            if !is_valid_topic(topic) {
+                6 // 404 Not Found (e.g. /favicon.ico, invalid chars)
+            } else {
+                topic_buf[..topic.len()].copy_from_slice(topic);
+                *topic_len = topic.len();
+                *replay_history = false; // live-only (safe for ephemeral tokens)
+                1
+            }
+        }
+        (Method::Post, path) => handle_post(
+            store,
+            disk,
+            path,
+            req,
+            json_buf,
+            broadcast_id,
+            topic_buf,
+            topic_len,
+            broadcast_len,
+            broadcast_topic_only,
+        ),
+        _ => 6, // 404 Not Found
     }
 }
 
