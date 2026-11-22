@@ -79,3 +79,12 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
 pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
     unsafe { memcmp(a, b, n) }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
+    let mut i = 0;
+    while unsafe { s.add(i).read_volatile() } != 0 {
+        i += 1;
+    }
+    i
+}
