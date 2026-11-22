@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rustix = { version = "1", default-features = false, features = ["net", "event", "stdio", "time"] }
+rustix = { version = "1", default-features = false, features = ["net", "event", "stdio", "time", "fs"] }
 
 [profile.dev]
 panic = "abort"

@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod disk;
 mod fmt;
 mod http;
 mod mem;
@@ -19,6 +20,7 @@ use rustix::net::{
 };
 use rustix::time::{ClockId, clock_gettime};
 
+use disk::DiskLog;
 use fmt::BufWriter;
 use http::{Method, ParseStatus, parse_request};
 use store::{Notification, Store};
@@ -81,6 +83,7 @@ extern "C" fn entry() -> ! {
     // SAFETY: Single-threaded program; `entry` is called once and owns both statics exclusively.
     let clients = unsafe { &mut *core::ptr::addr_of_mut!(CLIENTS) };
     let store = unsafe { &mut *core::ptr::addr_of_mut!(STORE) };
+    let disk = DiskLog::open_and_load(c"notifications.log", store);
 
     let listener = socket_with(
         AddressFamily::INET,
@@ -128,7 +131,7 @@ extern "C" fn entry() -> ! {
                     if flags.intersects(EventFlags::ERR | EventFlags::HUP | EventFlags::RDHUP) {
                         close_client(&epfd, &mut clients[slot]);
                     } else if flags.contains(EventFlags::IN) {
-                        handle_client_read(&epfd, clients, store, slot);
+                        handle_client_read(&epfd, clients, store, &disk, slot);
                     }
                 }
             }
@@ -174,6 +177,7 @@ fn handle_client_read(
     epfd: &OwnedFd,
     clients: &mut [Client; MAX_CLIENTS],
     store: &mut Store,
+    disk: &DiskLog,
     slot: usize,
 ) {
     if clients[slot].is_sse {
@@ -234,6 +238,7 @@ fn handle_client_read(
                     let ts = clock_gettime(ClockId::Realtime).tv_sec;
                     let notif = *store.push(ts, topic, req.title, req.priority, req.body);
                     let topic_name = store.topic_name(notif.topic_id);
+                    disk.append(&notif, topic_name);
                     broadcast_id = notif.id;
                     broadcast_len = notif.format_json(topic_name, &mut json_buf);
                     2u8
