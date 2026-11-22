@@ -370,13 +370,19 @@ fn handle_client_read(
 }
 
 fn send_http_response(fd: impl AsFd, content_type: &[u8], body: &[u8]) {
-    let mut hdr = [0u8; 160];
+    let mut hdr = [0u8; 384];
     let mut w = BufWriter::new(&mut hdr);
     w.push_bytes(b"HTTP/1.1 200 OK\r\nContent-Type: ");
     w.push_bytes(content_type);
     w.push_bytes(b"\r\nContent-Length: ");
     w.push_u64(body.len() as u64);
-    w.push_bytes(b"\r\nConnection: close\r\n\r\n");
+    w.push_bytes(
+        b"\r\nX-Content-Type-Options: nosniff\r\n\
+        X-Frame-Options: DENY\r\n\
+        Referrer-Policy: no-referrer\r\n\
+        Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:\r\n\
+        Connection: close\r\n\r\n",
+    );
     let hdr_len = w.len;
 
     if send_all(&fd, &hdr[..hdr_len]) {
