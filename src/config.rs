@@ -17,8 +17,11 @@ pub const DEFAULT_KEEPALIVE_SECS: i64 = 30;
 /// Maximum seconds a non-SSE client may stay idle before being closed (Slowloris protection).
 pub const READ_TIMEOUT_SECS: i64 = 10;
 
-/// Maximum simultaneous TCP connections (browsers + incoming POSTs).
+/// Maximum simultaneous in-flight HTTP requests (each holds a 4 KB read buffer).
 pub const MAX_CLIENTS: usize = 16;
+
+/// Maximum simultaneous live SSE subscribers (tiny ~40 B slots, no read buffer).
+pub const MAX_SSE_CLIENTS: usize = 16;
 
 /// Per-client HTTP read buffer size in bytes (4 KB handles Cloudflare Access headers).
 pub const READ_BUF_SIZE: usize = 4096;

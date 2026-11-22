@@ -24,7 +24,7 @@ use rustix::time::{ClockId, Timespec, clock_gettime};
 
 use config::{
     DEFAULT_KEEPALIVE_SECS, DEFAULT_LOG_PATH, DEFAULT_PORT, JSON_BUF_SIZE, MAX_BODY, MAX_CLIENTS,
-    MAX_TITLE, MAX_TOPIC, READ_BUF_SIZE, READ_TIMEOUT_SECS,
+    MAX_SSE_CLIENTS, MAX_TITLE, MAX_TOPIC, READ_BUF_SIZE, READ_TIMEOUT_SECS,
 };
 use disk::DiskLog;
 use env::Env;
@@ -37,32 +37,43 @@ const INDEX_HTML: &[u8] = include_bytes!("index.html");
 
 const LISTENER_TAG: u64 = u64::MAX;
 
-struct Client {
+struct HttpClient {
     fd: Option<OwnedFd>,
-    is_sse: bool,
-    /// When `is_sse == true`: `0` means subscribed to `/all`; `> 0` means subscribed
-    /// to `&read_buf[..sub_topic_len]` (reusing the idle read buffer for 0 extra RAM!).
-    sub_topic_len: u8,
-    connected_at: i64, // Monotonic seconds for total non-SSE request deadline
+    connected_at: i64, // Monotonic seconds for total HTTP request deadline
     read_len: usize,
     read_buf: [u8; READ_BUF_SIZE],
 }
 
-impl Client {
+impl HttpClient {
     const EMPTY: Self = Self {
         fd: None,
-        is_sse: false,
-        sub_topic_len: 0,
         connected_at: 0,
         read_len: 0,
         read_buf: [0; READ_BUF_SIZE],
     };
 }
 
+struct SseClient {
+    fd: Option<OwnedFd>,
+    /// `0` means subscribed to `/all`; `> 0` means subscribed to `&topic[..topic_len]`.
+    topic_len: u8,
+    topic: [u8; MAX_TOPIC],
+}
+
+impl SseClient {
+    const EMPTY: Self = Self {
+        fd: None,
+        topic_len: 0,
+        topic: [0; MAX_TOPIC],
+    };
+}
+
 /// Static zero-initialized storage (.bss).
 /// Linux lazy-pages .bss so unused client slots and unused history entries
 /// consume 0 KB of physical RAM until written.
-static mut CLIENTS: [Client; MAX_CLIENTS] = [const { Client::EMPTY }; MAX_CLIENTS];
+static mut HTTP_CLIENTS: [HttpClient; MAX_CLIENTS] = [const { HttpClient::EMPTY }; MAX_CLIENTS];
+static mut SSE_CLIENTS: [SseClient; MAX_SSE_CLIENTS] =
+    [const { SseClient::EMPTY }; MAX_SSE_CLIENTS];
 static mut STORE: Store = Store::EMPTY;
 
 #[unsafe(no_mangle)]
@@ -106,8 +117,9 @@ extern "C" fn entry(initial_sp: *const usize) -> ! {
         .unwrap_or(DEFAULT_KEEPALIVE_SECS);
     let auth_token = env.get(b"AUTH_TOKEN").filter(|t| !t.is_empty());
 
-    // SAFETY: Single-threaded program; `entry` is called once and owns both statics exclusively.
-    let clients = unsafe { &mut *core::ptr::addr_of_mut!(CLIENTS) };
+    // SAFETY: Single-threaded program; `entry` is called once and owns all statics exclusively.
+    let http_clients = unsafe { &mut *core::ptr::addr_of_mut!(HTTP_CLIENTS) };
+    let sse_clients = unsafe { &mut *core::ptr::addr_of_mut!(SSE_CLIENTS) };
     let store = unsafe { &mut *core::ptr::addr_of_mut!(STORE) };
     let disk = DiskLog::open_and_load(log_path, store);
 
@@ -163,32 +175,47 @@ extern "C" fn entry(initial_sp: *const usize) -> ! {
             let flags = ev.flags;
 
             if tag == LISTENER_TAG {
-                accept_new_clients(&epfd, &listener, clients, now);
+                accept_new_clients(&epfd, &listener, http_clients, now);
             } else {
-                let slot = tag as usize;
-                if slot < MAX_CLIENTS && clients[slot].fd.is_some() {
-                    if flags.intersects(EventFlags::ERR | EventFlags::HUP | EventFlags::RDHUP) {
-                        close_client(&epfd, &mut clients[slot]);
-                    } else if flags.contains(EventFlags::IN) {
-                        handle_client_read(&epfd, clients, store, &disk, auth_token, slot);
+                let idx = tag as usize;
+                if idx < MAX_CLIENTS {
+                    if http_clients[idx].fd.is_some() {
+                        if flags.intersects(EventFlags::ERR | EventFlags::HUP | EventFlags::RDHUP) {
+                            close_http_client(&epfd, &mut http_clients[idx]);
+                        } else if flags.contains(EventFlags::IN) {
+                            handle_client_read(
+                                &epfd,
+                                http_clients,
+                                sse_clients,
+                                store,
+                                &disk,
+                                auth_token,
+                                idx,
+                            );
+                        }
+                    }
+                } else {
+                    let sse_slot = idx - MAX_CLIENTS;
+                    if sse_slot < MAX_SSE_CLIENTS
+                        && sse_clients[sse_slot].fd.is_some()
+                        && flags.intersects(EventFlags::ERR | EventFlags::HUP | EventFlags::RDHUP)
+                    {
+                        close_sse_client(&epfd, &mut sse_clients[sse_slot]);
                     }
                 }
             }
         }
 
-        // Reap slow/idle non-SSE connections (hard deadline defeats trickle Slowloris)
-        for client in clients.iter_mut() {
-            if client.fd.is_some()
-                && !client.is_sse
-                && now.saturating_sub(client.connected_at) >= READ_TIMEOUT_SECS
-            {
-                close_client(&epfd, client);
+        // Reap slow/idle HTTP connections (hard deadline defeats trickle Slowloris)
+        for client in http_clients.iter_mut() {
+            if client.fd.is_some() && now.saturating_sub(client.connected_at) >= READ_TIMEOUT_SECS {
+                close_http_client(&epfd, client);
             }
         }
 
         // Monotonic SSE keepalive (cannot be starved by activity on other sockets)
         if now.saturating_sub(last_keepalive) >= keepalive_secs {
-            send_sse_keepalive(&epfd, clients);
+            send_sse_keepalive(&epfd, sse_clients);
             last_keepalive = now;
         }
     }
@@ -201,7 +228,7 @@ fn monotonic_secs() -> i64 {
 fn accept_new_clients(
     epfd: &OwnedFd,
     listener: &OwnedFd,
-    clients: &mut [Client; MAX_CLIENTS],
+    http_clients: &mut [HttpClient; MAX_CLIENTS],
     now: i64,
 ) {
     loop {
@@ -209,7 +236,7 @@ fn accept_new_clients(
             break;
         };
 
-        for (slot, client) in clients.iter_mut().enumerate() {
+        for (slot, client) in http_clients.iter_mut().enumerate() {
             if client.fd.is_none() {
                 if epoll::add(
                     epfd,
@@ -220,8 +247,6 @@ fn accept_new_clients(
                 .is_ok()
                 {
                     client.fd = Some(fd);
-                    client.is_sse = false;
-                    client.sub_topic_len = 0;
                     client.connected_at = now;
                     client.read_len = 0;
                 }
@@ -231,62 +256,55 @@ fn accept_new_clients(
     }
 }
 
-fn close_client(epfd: &OwnedFd, client: &mut Client) {
+fn close_http_client(epfd: &OwnedFd, client: &mut HttpClient) {
     if let Some(fd) = client.fd.take() {
         let _ = epoll::delete(epfd, &fd);
     }
-    client.is_sse = false;
-    client.sub_topic_len = 0;
     client.read_len = 0;
+}
+
+fn close_sse_client(epfd: &OwnedFd, client: &mut SseClient) {
+    if let Some(fd) = client.fd.take() {
+        let _ = epoll::delete(epfd, &fd);
+    }
+    client.topic_len = 0;
 }
 
 fn handle_client_read(
     epfd: &OwnedFd,
-    clients: &mut [Client; MAX_CLIENTS],
+    http_clients: &mut [HttpClient; MAX_CLIENTS],
+    sse_clients: &mut [SseClient; MAX_SSE_CLIENTS],
     store: &mut Store,
     disk: &DiskLog,
     auth_token: Option<&[u8]>,
     slot: usize,
 ) {
-    if clients[slot].is_sse {
-        let mut tmp = [0u8; 64];
-        let closed = match clients[slot].fd.as_ref().map(|fd| io::read(fd, &mut tmp)) {
-            Some(Ok(0)) => true,
-            Some(Err(e)) if e != Errno::AGAIN => true,
-            _ => false,
-        };
-        if closed {
-            close_client(epfd, &mut clients[slot]);
-        }
-        return;
-    }
-
-    let len = clients[slot].read_len;
+    let len = http_clients[slot].read_len;
     if len >= READ_BUF_SIZE {
-        close_client(epfd, &mut clients[slot]);
+        close_http_client(epfd, &mut http_clients[slot]);
         return;
     }
 
     let read_res = {
-        let client = &mut clients[slot];
+        let client = &mut http_clients[slot];
         let Some(fd) = client.fd.as_ref() else { return };
         io::read(fd, &mut client.read_buf[len..])
     };
 
     let n = match read_res {
         Ok(0) => {
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
             return;
         }
         Ok(n) => n,
         Err(Errno::AGAIN) => return,
         Err(_) => {
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
             return;
         }
     };
 
-    clients[slot].read_len += n;
+    http_clients[slot].read_len += n;
 
     // Parse the HTTP request in-place from read_buf (zero allocations!)
     let mut json_buf = [0u8; JSON_BUF_SIZE];
@@ -299,7 +317,7 @@ fn handle_client_read(
     let mut last_event_id: u64 = 0;
 
     let action = {
-        let data = &clients[slot].read_buf[..clients[slot].read_len];
+        let data = &http_clients[slot].read_buf[..http_clients[slot].read_len];
         match parse_request(data) {
             ParseStatus::Incomplete => return,
             ParseStatus::Invalid => 5u8, // 400 Bad Request
@@ -346,6 +364,19 @@ fn handle_client_read(
 
     match action {
         1 => {
+            let Some(sse_slot) = sse_clients.iter().position(|c| c.fd.is_none()) else {
+                if let Some(fd) = http_clients[slot].fd.as_ref() {
+                    send_http_status(
+                        fd,
+                        b"503 Service Unavailable",
+                        b"text/plain",
+                        b"too many subscribers\n",
+                    );
+                }
+                close_http_client(epfd, &mut http_clients[slot]);
+                return;
+            };
+
             // Upgrade connection to live SSE stream
             let sse_headers = b"HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
@@ -353,13 +384,13 @@ fn handle_client_read(
                 X-Content-Type-Options: nosniff\r\n\
                 Connection: keep-alive\r\n\r\n";
 
-            let mut ok = clients[slot]
+            let mut ok = http_clients[slot]
                 .fd
                 .as_ref()
                 .is_some_and(|fd| send_all(fd, sse_headers));
 
             if ok && replay_history {
-                let fd = clients[slot].fd.as_ref().unwrap();
+                let fd = http_clients[slot].fd.as_ref().unwrap();
                 store.for_each_oldest_first(|notif, topic_name| {
                     if ok && notif.id > last_event_id {
                         ok = send_sse_event(fd, notif, topic_name, &mut json_buf);
@@ -368,19 +399,35 @@ fn handle_client_read(
             }
 
             if ok {
-                clients[slot].is_sse = true;
-                clients[slot].sub_topic_len = topic_len as u8;
-                if topic_len > 0 {
-                    clients[slot].read_buf[..topic_len].copy_from_slice(&topic_buf[..topic_len]);
+                // Move FD out of the 4 KB HTTP slot into the tiny ~40 B SSE slot
+                // and watch RDHUP only (no EPOLLIN) so HTTP slots stay free for POSTs.
+                if let Some(fd) = http_clients[slot].fd.take() {
+                    http_clients[slot].read_len = 0;
+                    if epoll::modify(
+                        epfd,
+                        &fd,
+                        EventData::new_u64((MAX_CLIENTS + sse_slot) as u64),
+                        EventFlags::RDHUP,
+                    )
+                    .is_ok()
+                    {
+                        let sse = &mut sse_clients[sse_slot];
+                        sse.fd = Some(fd);
+                        sse.topic_len = topic_len as u8;
+                        if topic_len > 0 {
+                            sse.topic[..topic_len].copy_from_slice(&topic_buf[..topic_len]);
+                        }
+                    } else {
+                        let _ = epoll::delete(epfd, &fd);
+                    }
                 }
-                clients[slot].read_len = 0;
             } else {
-                close_client(epfd, &mut clients[slot]);
+                close_http_client(epfd, &mut http_clients[slot]);
             }
         }
         2 => {
             // Reply to POST sender with the stored JSON notification
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(
                     fd,
                     b"200 OK",
@@ -388,12 +435,12 @@ fn handle_client_read(
                     &json_buf[..broadcast_len],
                 );
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
 
             // Broadcast to subscribers (ephemeral messages go ONLY to matching /<topic> subscribers)
             broadcast_sse_json(
                 epfd,
-                clients,
+                sse_clients,
                 broadcast_id,
                 &topic_buf[..topic_len],
                 broadcast_topic_only,
@@ -402,31 +449,31 @@ fn handle_client_read(
         }
         3 => {
             // Serve the embedded web UI
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(fd, b"200 OK", b"text/html; charset=utf-8", INDEX_HTML);
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
         }
         4 => {
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(fd, b"200 OK", b"text/plain", b"ok\n");
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
         }
         5 => {
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(fd, b"400 Bad Request", b"text/plain", b"bad request\n");
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
         }
         6 => {
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(fd, b"404 Not Found", b"text/plain", b"not found\n");
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
         }
         7 => {
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(
                     fd,
                     b"507 Insufficient Storage",
@@ -434,15 +481,15 @@ fn handle_client_read(
                     b"topic limit reached\n",
                 );
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
         }
         8 => {
-            if let Some(fd) = clients[slot].fd.as_ref() {
+            if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(fd, b"401 Unauthorized", b"text/plain", b"unauthorized\n");
             }
-            close_client(epfd, &mut clients[slot]);
+            close_http_client(epfd, &mut http_clients[slot]);
         }
-        _ => close_client(epfd, &mut clients[slot]),
+        _ => close_http_client(epfd, &mut http_clients[slot]),
     }
 }
 
@@ -611,15 +658,11 @@ fn send_sse_frame(fd: impl AsFd, id: u64, json: &[u8]) -> bool {
     send_all(&fd, &prefix[..prefix_len]) && send_all(&fd, json) && send_all(&fd, b"\n\n")
 }
 
-fn send_sse_keepalive(epfd: &OwnedFd, clients: &mut [Client; MAX_CLIENTS]) {
-    for client in clients.iter_mut() {
-        if client.is_sse {
-            let ok = client
-                .fd
-                .as_ref()
-                .is_some_and(|fd| send_all(fd, b": ping\n\n"));
-            if !ok {
-                close_client(epfd, client);
+fn send_sse_keepalive(epfd: &OwnedFd, sse_clients: &mut [SseClient; MAX_SSE_CLIENTS]) {
+    for client in sse_clients.iter_mut() {
+        if let Some(fd) = client.fd.as_ref() {
+            if !send_all(fd, b": ping\n\n") {
+                close_sse_client(epfd, client);
             }
         }
     }
@@ -627,26 +670,23 @@ fn send_sse_keepalive(epfd: &OwnedFd, clients: &mut [Client; MAX_CLIENTS]) {
 
 fn broadcast_sse_json(
     epfd: &OwnedFd,
-    clients: &mut [Client; MAX_CLIENTS],
+    sse_clients: &mut [SseClient; MAX_SSE_CLIENTS],
     id: u64,
     topic: &[u8],
     topic_only: bool,
     json: &[u8],
 ) {
-    for client in clients.iter_mut() {
-        let matches = if client.sub_topic_len == 0 {
+    for client in sse_clients.iter_mut() {
+        let Some(fd) = client.fd.as_ref() else {
+            continue;
+        };
+        let matches = if client.topic_len == 0 {
             !topic_only
         } else {
-            &client.read_buf[..client.sub_topic_len as usize] == topic
+            &client.topic[..client.topic_len as usize] == topic
         };
-        if client.is_sse && matches {
-            let ok = client
-                .fd
-                .as_ref()
-                .is_some_and(|fd| send_sse_frame(fd, id, json));
-            if !ok {
-                close_client(epfd, client);
-            }
+        if matches && !send_sse_frame(fd, id, json) {
+            close_sse_client(epfd, client);
         }
     }
 }
