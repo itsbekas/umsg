@@ -4,6 +4,7 @@
 //! `Request<'a>` is just a borrowed slice (`&'a [u8]`) pointing directly into
 //! the client's existing `read_buf`.
 
+#[derive(Copy, Clone)]
 pub enum Method {
     Get,
     Post,
@@ -16,6 +17,8 @@ pub struct Request<'a> {
     pub title: &'a [u8],
     pub priority: u8, // 1=min, 2=low, 3=default, 4=high, 5=urgent
     pub last_event_id: u64,
+    pub ephemeral: bool,
+    pub auth: &'a [u8],
     pub body: &'a [u8],
 }
 
@@ -63,6 +66,8 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
     let mut title: &[u8] = b"";
     let mut priority: u8 = 3;
     let mut last_event_id: u64 = 0;
+    let mut ephemeral = false;
+    let mut auth: &[u8] = b"";
 
     let mut pos = first_line_end;
     while pos + 2 <= head.len() {
@@ -98,6 +103,14 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
                 if let Some(n) = parse_usize(val) {
                     last_event_id = n as u64;
                 }
+            } else if eq_ignore_ascii_case(name, b"ephemeral")
+                || eq_ignore_ascii_case(name, b"x-ephemeral")
+            {
+                ephemeral = val == b"1"
+                    || eq_ignore_ascii_case(val, b"true")
+                    || eq_ignore_ascii_case(val, b"yes");
+            } else if eq_ignore_ascii_case(name, b"authorization") {
+                auth = val;
             }
         }
 
@@ -118,6 +131,8 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
         title,
         priority,
         last_event_id,
+        ephemeral,
+        auth,
         body,
     })
 }

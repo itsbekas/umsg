@@ -32,7 +32,7 @@ impl DiskLog {
     /// existing records into `store`.
     pub fn open_and_load(path: &[u8], store: &mut Store) -> Self {
         let flags = OFlags::RDWR | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC;
-        let mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH; // 0644
+        let mode = Mode::RUSR | Mode::WUSR; // 0600 (owner read/write only)
 
         let Ok(fd) = openat(CWD, path, flags, mode) else {
             return Self { fd: None };
@@ -43,9 +43,9 @@ impl DiskLog {
         let mut buf = [0u8; 4096];
         let mut filled: usize = 0;
 
-        loop {
+        'read: loop {
             match io::read(&fd, &mut buf[filled..]) {
-                Ok(0) => break,
+                Ok(0) => break 'read,
                 Ok(n) => {
                     filled += n;
                     let mut pos = 0;
@@ -66,11 +66,9 @@ impl DiskLog {
                         let ttlen = buf[pos + 10] as usize;
                         let blen = buf[pos + 11] as usize;
 
-                        // Sanity check against corrupted records
+                        // Stop reading entirely on corrupt record to avoid offset misalignment
                         if tlen > MAX_TOPIC || ttlen > MAX_TITLE || blen > MAX_BODY {
-                            filled = 0;
-                            pos = 0;
-                            break;
+                            break 'read;
                         }
 
                         let rec_len = HEADER_LEN + tlen + ttlen + blen;
@@ -82,7 +80,7 @@ impl DiskLog {
                         let title_start = topic_start + tlen;
                         let body_start = title_start + ttlen;
 
-                        store.push(
+                        let _ = store.push(
                             ts,
                             &buf[topic_start..title_start],
                             &buf[title_start..body_start],
@@ -101,7 +99,7 @@ impl DiskLog {
                     filled = rem;
                 }
                 Err(Errno::INTR) => continue,
-                Err(_) => break,
+                Err(_) => break 'read,
             }
         }
 

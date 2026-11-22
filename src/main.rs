@@ -24,7 +24,7 @@ use rustix::time::{ClockId, Timespec, clock_gettime};
 
 use config::{
     DEFAULT_KEEPALIVE_SECS, DEFAULT_LOG_PATH, DEFAULT_PORT, JSON_BUF_SIZE, MAX_CLIENTS,
-    READ_BUF_SIZE,
+    READ_BUF_SIZE, READ_TIMEOUT_SECS,
 };
 use disk::DiskLog;
 use env::Env;
@@ -41,6 +41,7 @@ struct Client {
     fd: Option<OwnedFd>,
     is_sse: bool,
     sub_topic: Option<u8>, // None = all topics (/all), Some(id) = single topic (/<topic>)
+    last_activity: i64,    // Monotonic seconds for Slowloris read timeout
     read_len: usize,
     read_buf: [u8; READ_BUF_SIZE],
 }
@@ -50,6 +51,7 @@ impl Client {
         fd: None,
         is_sse: false,
         sub_topic: None,
+        last_activity: 0,
         read_len: 0,
         read_buf: [0; READ_BUF_SIZE],
     };
@@ -98,8 +100,9 @@ extern "C" fn entry(initial_sp: *const usize) -> ! {
     let log_path = env.get(b"LOG_PATH").unwrap_or(DEFAULT_LOG_PATH);
     let keepalive_secs = env
         .get_u64(b"KEEPALIVE_SECS")
-        .map(|s| s as i64)
+        .map(|s| s.clamp(1, 3600) as i64)
         .unwrap_or(DEFAULT_KEEPALIVE_SECS);
+    let auth_token = env.get(b"AUTH_TOKEN").filter(|t| !t.is_empty());
 
     // SAFETY: Single-threaded program; `entry` is called once and owns both statics exclusively.
     let clients = unsafe { &mut *core::ptr::addr_of_mut!(CLIENTS) };
@@ -137,43 +140,68 @@ extern "C" fn entry(initial_sp: *const usize) -> ! {
     let _ = io::write(unsafe { rustix::stdio::stdout() }, &banner[..banner_len]);
 
     let mut events = [MaybeUninit::<Event>::uninit(); MAX_CLIENTS];
-    let keepalive = Timespec {
-        tv_sec: keepalive_secs,
+    let poll_tick = Timespec {
+        tv_sec: keepalive_secs.min(5),
         tv_nsec: 0,
     };
+    let mut last_keepalive = monotonic_secs();
 
     loop {
-        let Ok((ready, _)) = epoll::wait(&epfd, &mut events, Some(&keepalive)) else {
-            continue;
+        let ready_count = match epoll::wait(&epfd, &mut events, Some(&poll_tick)) {
+            Ok((ready, _)) => ready.len(),
+            Err(_) => 0,
         };
 
-        // 30s idle timeout: send SSE comment ping so Cloudflare Tunnel keeps tabs alive
-        if ready.is_empty() {
-            send_sse_keepalive(&epfd, clients);
-            continue;
-        }
+        let now = monotonic_secs();
 
-        for ev in ready {
+        for ev in &events[..ready_count] {
+            // SAFETY: kernel initialized `events[..ready_count]`.
+            let ev = unsafe { ev.assume_init_ref() };
             let tag = ev.data.u64();
             let flags = ev.flags;
 
             if tag == LISTENER_TAG {
-                accept_new_clients(&epfd, &listener, clients);
+                accept_new_clients(&epfd, &listener, clients, now);
             } else {
                 let slot = tag as usize;
                 if slot < MAX_CLIENTS && clients[slot].fd.is_some() {
                     if flags.intersects(EventFlags::ERR | EventFlags::HUP | EventFlags::RDHUP) {
                         close_client(&epfd, &mut clients[slot]);
                     } else if flags.contains(EventFlags::IN) {
-                        handle_client_read(&epfd, clients, store, &disk, slot);
+                        handle_client_read(&epfd, clients, store, &disk, auth_token, slot, now);
                     }
                 }
             }
         }
+
+        // Reap idle non-SSE connections (Slowloris protection)
+        for client in clients.iter_mut() {
+            if client.fd.is_some()
+                && !client.is_sse
+                && now.saturating_sub(client.last_activity) >= READ_TIMEOUT_SECS
+            {
+                close_client(&epfd, client);
+            }
+        }
+
+        // Monotonic SSE keepalive (cannot be starved by activity on other sockets)
+        if now.saturating_sub(last_keepalive) >= keepalive_secs {
+            send_sse_keepalive(&epfd, clients);
+            last_keepalive = now;
+        }
     }
 }
 
-fn accept_new_clients(epfd: &OwnedFd, listener: &OwnedFd, clients: &mut [Client; MAX_CLIENTS]) {
+fn monotonic_secs() -> i64 {
+    clock_gettime(ClockId::Monotonic).tv_sec
+}
+
+fn accept_new_clients(
+    epfd: &OwnedFd,
+    listener: &OwnedFd,
+    clients: &mut [Client; MAX_CLIENTS],
+    now: i64,
+) {
     loop {
         let Ok(fd) = accept_with(listener, SocketFlags::NONBLOCK | SocketFlags::CLOEXEC) else {
             break;
@@ -192,6 +220,7 @@ fn accept_new_clients(epfd: &OwnedFd, listener: &OwnedFd, clients: &mut [Client;
                     client.fd = Some(fd);
                     client.is_sse = false;
                     client.sub_topic = None;
+                    client.last_activity = now;
                     client.read_len = 0;
                 }
                 break;
@@ -214,7 +243,9 @@ fn handle_client_read(
     clients: &mut [Client; MAX_CLIENTS],
     store: &mut Store,
     disk: &DiskLog,
+    auth_token: Option<&[u8]>,
     slot: usize,
+    now: i64,
 ) {
     if clients[slot].is_sse {
         let mut tmp = [0u8; 64];
@@ -255,12 +286,14 @@ fn handle_client_read(
     };
 
     clients[slot].read_len += n;
+    clients[slot].last_activity = now;
 
     // Parse the HTTP request in-place from read_buf (zero allocations!)
     let mut json_buf = [0u8; JSON_BUF_SIZE];
     let mut broadcast_len: usize = 0;
     let mut broadcast_id: u64 = 0;
     let mut broadcast_topic_id: u8 = 0;
+    let mut broadcast_topic_only = false;
     let mut sub_topic: Option<u8> = None;
     let mut replay_history = false;
     let mut last_event_id: u64 = 0;
@@ -292,24 +325,35 @@ fn handle_client_read(
                     }
                 }
                 (Method::Post, path) => {
-                    let topic = path.strip_prefix(b"/").unwrap_or(path);
-                    let topic = if topic.is_empty() { b"default" } else { topic };
-                    if !is_valid_topic(topic) {
-                        5u8 // 400 Bad Request
-                    } else {
-                        let ts = clock_gettime(ClockId::Realtime).tv_sec;
-                        if let Some(notif) =
-                            store.push(ts, topic, req.title, req.priority, req.body).copied()
-                        {
-                            let topic_name = store.topic_name(notif.topic_id);
-                            disk.append(&notif, topic_name);
-                            broadcast_id = notif.id;
-                            broadcast_topic_id = notif.topic_id;
-                            broadcast_len = notif.format_json(topic_name, &mut json_buf);
-                            2u8
+                    if let Some(expected) = auth_token {
+                        let supplied = req.auth.strip_prefix(b"Bearer ").unwrap_or(b"");
+                        if !const_time_eq(supplied, expected) {
+                            8u8 // 401 Unauthorized
                         } else {
-                            7u8 // 507 Insufficient Storage
+                            handle_post(
+                                store,
+                                disk,
+                                path,
+                                &req,
+                                &mut json_buf,
+                                &mut broadcast_id,
+                                &mut broadcast_topic_id,
+                                &mut broadcast_len,
+                                &mut broadcast_topic_only,
+                            )
                         }
+                    } else {
+                        handle_post(
+                            store,
+                            disk,
+                            path,
+                            &req,
+                            &mut json_buf,
+                            &mut broadcast_id,
+                            &mut broadcast_topic_id,
+                            &mut broadcast_len,
+                            &mut broadcast_topic_only,
+                        )
                     }
                 }
                 _ => 6u8, // 404 Not Found
@@ -360,12 +404,13 @@ fn handle_client_read(
             }
             close_client(epfd, &mut clients[slot]);
 
-            // Broadcast to /all subscribers and matching /<topic> subscribers
+            // Broadcast to subscribers (ephemeral messages go ONLY to matching /<topic> subscribers)
             broadcast_sse_json(
                 epfd,
                 clients,
                 broadcast_id,
                 broadcast_topic_id,
+                broadcast_topic_only,
                 &json_buf[..broadcast_len],
             );
         }
@@ -405,8 +450,87 @@ fn handle_client_read(
             }
             close_client(epfd, &mut clients[slot]);
         }
+        8 => {
+            if let Some(fd) = clients[slot].fd.as_ref() {
+                send_http_status(fd, b"401 Unauthorized", b"text/plain", b"unauthorized\n");
+            }
+            close_client(epfd, &mut clients[slot]);
+        }
         _ => close_client(epfd, &mut clients[slot]),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_post(
+    store: &mut Store,
+    disk: &DiskLog,
+    path: &[u8],
+    req: &http::Request<'_>,
+    json_buf: &mut [u8; JSON_BUF_SIZE],
+    broadcast_id: &mut u64,
+    broadcast_topic_id: &mut u8,
+    broadcast_len: &mut usize,
+    broadcast_topic_only: &mut bool,
+) -> u8 {
+    let topic = path.strip_prefix(b"/").unwrap_or(path);
+    let topic = if topic.is_empty() { b"default" } else { topic };
+    if !is_valid_topic(topic) {
+        return 5; // 400 Bad Request
+    }
+
+    let ts = clock_gettime(ClockId::Realtime).tv_sec;
+
+    if req.ephemeral {
+        // Ephemeral message (e.g. 2FA code): broadcast live to /<topic> ONLY,
+        // never stored in ring buffer, never written to disk, never sent to /all.
+        let Some(tid) = store.intern_topic(topic) else {
+            return 7; // 507 Insufficient Storage
+        };
+        let mut tmp = Notification::EMPTY;
+        tmp.id = 0;
+        tmp.timestamp = ts;
+        tmp.priority = req.priority;
+        tmp.topic_id = tid;
+        let tlen = req.title.len().min(config::MAX_TITLE);
+        tmp.title[..tlen].copy_from_slice(&req.title[..tlen]);
+        tmp.title_len = tlen as u8;
+        let blen = req.body.len().min(config::MAX_BODY);
+        tmp.body[..blen].copy_from_slice(&req.body[..blen]);
+        tmp.body_len = blen as u8;
+
+        *broadcast_id = 0;
+        *broadcast_topic_id = tid;
+        *broadcast_topic_only = true;
+        *broadcast_len = tmp.format_json(store.topic_name(tid), json_buf);
+        return 2;
+    }
+
+    if let Some(notif) = store
+        .push(ts, topic, req.title, req.priority, req.body)
+        .copied()
+    {
+        let topic_name = store.topic_name(notif.topic_id);
+        disk.append(&notif, topic_name);
+        *broadcast_id = notif.id;
+        *broadcast_topic_id = notif.topic_id;
+        *broadcast_topic_only = false;
+        *broadcast_len = notif.format_json(topic_name, json_buf);
+        2
+    } else {
+        7 // 507 Insufficient Storage
+    }
+}
+
+/// Constant-time byte slice comparison (does not short-circuit on mismatch).
+fn const_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn send_http_status(fd: impl AsFd, status: &[u8], content_type: &[u8], body: &[u8]) {
@@ -472,10 +596,15 @@ fn broadcast_sse_json(
     clients: &mut [Client; MAX_CLIENTS],
     id: u64,
     topic_id: u8,
+    topic_only: bool,
     json: &[u8],
 ) {
     for client in clients.iter_mut() {
-        if client.is_sse && client.sub_topic.is_none_or(|t| t == topic_id) {
+        let matches = match client.sub_topic {
+            Some(t) => t == topic_id,
+            None => !topic_only,
+        };
+        if client.is_sse && matches {
             let ok = client
                 .fd
                 .as_ref()

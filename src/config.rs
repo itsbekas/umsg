@@ -11,8 +11,11 @@ pub const DEFAULT_PORT: u16 = 8080;
 /// Default append-only binary log path (override at runtime with `LOG_PATH`).
 pub const DEFAULT_LOG_PATH: &[u8] = b"notifications.log";
 
-/// Default SSE keepalive interval in seconds (override at runtime with `KEEPALIVE_SECS`).
+/// Default SSE keepalive interval in seconds (override at runtime with `KEEPALIVE_SECS`, clamped 1..=3600).
 pub const DEFAULT_KEEPALIVE_SECS: i64 = 30;
+
+/// Maximum seconds a non-SSE client may stay idle before being closed (Slowloris protection).
+pub const READ_TIMEOUT_SECS: i64 = 10;
 
 /// Maximum simultaneous TCP connections (browsers + incoming POSTs).
 pub const MAX_CLIENTS: usize = 16;
