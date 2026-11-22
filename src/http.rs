@@ -8,6 +8,7 @@ use rustix::fd::AsFd;
 use rustix::io::Errno;
 use rustix::net::{SendFlags, send};
 
+use crate::config::READ_BUF_SIZE;
 use crate::fmt::BufWriter;
 
 #[derive(Copy, Clone)]
@@ -73,7 +74,7 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
     let mut priority: u8 = 3;
     let mut last_event_id: u64 = 0;
     let mut ephemeral = false;
-    let mut auth: &[u8] = b"";
+    let mut auth: Option<&[u8]> = None;
 
     let mut pos = first_line_end;
     while pos + 2 <= head.len() {
@@ -83,47 +84,60 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
             .unwrap_or(head.len());
         let line = &head[pos..line_end];
 
-        if let Some(colon) = find_byte(line, b':') {
-            let name = &line[..colon];
-            let val = trim_ascii(&line[colon + 1..]);
+        // Reject bare CR/LF and malformed headers (request-smuggling protection)
+        if line.iter().any(|&b| b == b'\r' || b == b'\n') {
+            return ParseStatus::Invalid;
+        }
+        let Some(colon) = find_byte(line, b':') else {
+            return ParseStatus::Invalid;
+        };
+        let name = &line[..colon];
+        if name.is_empty() || name.iter().any(|&b| b <= 0x20 || b >= 0x7f) {
+            return ParseStatus::Invalid;
+        }
+        let val = trim_ascii(&line[colon + 1..]);
 
-            if eq_ignore_ascii_case(name, b"content-length") {
-                // Reject duplicate or malformed Content-Length (request smuggling protection)
-                if content_length.is_some() {
-                    return ParseStatus::Invalid;
-                }
-                let Some(n) = parse_usize(val) else {
-                    return ParseStatus::Invalid;
-                };
-                content_length = Some(n);
-            } else if eq_ignore_ascii_case(name, b"transfer-encoding") {
+        if eq_ignore_ascii_case(name, b"content-length") {
+            // Reject duplicate or malformed Content-Length (request smuggling protection)
+            if content_length.is_some() {
                 return ParseStatus::Invalid;
-            } else if eq_ignore_ascii_case(name, b"title") || eq_ignore_ascii_case(name, b"x-title")
-            {
-                title = val;
-            } else if eq_ignore_ascii_case(name, b"priority")
-                || eq_ignore_ascii_case(name, b"x-priority")
-            {
-                priority = parse_priority(val);
-            } else if eq_ignore_ascii_case(name, b"last-event-id") {
-                if let Some(n) = parse_usize(val) {
-                    last_event_id = n as u64;
-                }
-            } else if eq_ignore_ascii_case(name, b"ephemeral")
-                || eq_ignore_ascii_case(name, b"x-ephemeral")
-            {
-                ephemeral = val == b"1"
-                    || eq_ignore_ascii_case(val, b"true")
-                    || eq_ignore_ascii_case(val, b"yes");
-            } else if eq_ignore_ascii_case(name, b"authorization") {
-                auth = val;
             }
+            let Some(n) = parse_usize(val) else {
+                return ParseStatus::Invalid;
+            };
+            content_length = Some(n);
+        } else if eq_ignore_ascii_case(name, b"transfer-encoding") {
+            return ParseStatus::Invalid;
+        } else if eq_ignore_ascii_case(name, b"title") || eq_ignore_ascii_case(name, b"x-title") {
+            title = val;
+        } else if eq_ignore_ascii_case(name, b"priority")
+            || eq_ignore_ascii_case(name, b"x-priority")
+        {
+            priority = parse_priority(val);
+        } else if eq_ignore_ascii_case(name, b"last-event-id") {
+            if let Some(n) = parse_usize(val) {
+                last_event_id = n as u64;
+            }
+        } else if eq_ignore_ascii_case(name, b"ephemeral")
+            || eq_ignore_ascii_case(name, b"x-ephemeral")
+        {
+            ephemeral = val == b"1"
+                || eq_ignore_ascii_case(val, b"true")
+                || eq_ignore_ascii_case(val, b"yes");
+        } else if eq_ignore_ascii_case(name, b"authorization") {
+            if auth.is_some() {
+                return ParseStatus::Invalid;
+            }
+            auth = Some(val);
         }
 
         pos = line_end;
     }
 
     let expected_len = content_length.unwrap_or(0);
+    if expected_len > READ_BUF_SIZE.saturating_sub(body_start) {
+        return ParseStatus::Invalid;
+    }
     let available_body = buf.len() - body_start;
     if available_body < expected_len {
         return ParseStatus::Incomplete;
@@ -138,7 +152,7 @@ pub fn parse_request(buf: &[u8]) -> ParseStatus<'_> {
         priority,
         last_event_id,
         ephemeral,
-        auth,
+        auth: auth.unwrap_or(b""),
         body,
     })
 }
