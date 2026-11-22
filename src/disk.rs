@@ -13,13 +13,12 @@
 //! Max record size = 12 + 32 + 64 + 128 = 236 bytes (fits in a 256-byte stack buffer!).
 //! Uses ~0 KB of persistent RAM — only temporary stack buffers during read/write.
 
-use core::ffi::CStr;
-
 use rustix::fd::OwnedFd;
 use rustix::fs::{CWD, Mode, OFlags, openat};
 use rustix::io::{self, Errno};
 
-use crate::store::{MAX_BODY, MAX_TITLE, MAX_TOPIC, Notification, Store};
+use crate::config::{MAX_BODY, MAX_TITLE, MAX_TOPIC};
+use crate::store::{Notification, Store};
 
 const HEADER_LEN: usize = 12;
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_TOPIC + MAX_TITLE + MAX_BODY; // 236 bytes
@@ -29,20 +28,9 @@ pub struct DiskLog {
 }
 
 impl DiskLog {
-    /// Tries `/data/notifications.log` first (for Docker volume mounts),
-    /// falling back to `notifications.log` in the current working directory.
-    pub fn open_default(store: &mut Store) -> Self {
-        let log = Self::open_and_load(c"/data/notifications.log", store);
-        if log.fd.is_some() {
-            log
-        } else {
-            Self::open_and_load(c"notifications.log", store)
-        }
-    }
-
     /// Opens (or creates) `path` for reading & appending, and replays any
     /// existing records into `store`.
-    pub fn open_and_load(path: &CStr, store: &mut Store) -> Self {
+    pub fn open_and_load(path: &[u8], store: &mut Store) -> Self {
         let flags = OFlags::RDWR | OFlags::CREATE | OFlags::APPEND | OFlags::CLOEXEC;
         let mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH; // 0644
 

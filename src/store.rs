@@ -4,12 +4,7 @@
 //! table, so each `Notification` only stores a 1-byte `topic_id`. Because `Store`
 //! is all-zero initialized, it lives in `.bss` (0 bytes on disk, lazy-paged in RAM).
 
-pub const MAX_HISTORY: usize = 64;
-pub const MAX_TOPICS: usize = 16;
-pub const MAX_TOPIC: usize = 32;
-pub const MAX_TITLE: usize = 64;
-pub const MAX_BODY: usize = 128;
-
+use crate::config::{MAX_BODY, MAX_HISTORY, MAX_TITLE, MAX_TOPIC, MAX_TOPICS};
 use crate::fmt::BufWriter;
 
 #[derive(Copy, Clone)]

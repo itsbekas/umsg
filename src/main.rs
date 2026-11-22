@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod config;
 mod disk;
+mod env;
 mod fmt;
 mod http;
 mod mem;
@@ -20,14 +22,15 @@ use rustix::net::{
 };
 use rustix::time::{ClockId, Timespec, clock_gettime};
 
+use config::{
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_LOG_PATH, DEFAULT_PORT, JSON_BUF_SIZE, MAX_CLIENTS,
+    READ_BUF_SIZE,
+};
 use disk::DiskLog;
+use env::Env;
 use fmt::BufWriter;
 use http::{Method, ParseStatus, parse_request};
 use store::{Notification, Store};
-
-const MAX_CLIENTS: usize = 16;
-const READ_BUF_SIZE: usize = 1024;
-const JSON_BUF_SIZE: usize = 512;
 
 /// Embedded directly in `.rodata` — 1 memory page (4 KB), only paged in when requested.
 const INDEX_HTML: &[u8] = include_bytes!("index.html");
@@ -62,6 +65,7 @@ static mut STORE: Store = Store::EMPTY;
 #[unsafe(naked)]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        "mov rdi, rsp",
         "and rsp, -16",
         "call {entry}",
         entry = sym entry,
@@ -84,11 +88,23 @@ fn panic(_info: &PanicInfo) -> ! {
     exit(1)
 }
 
-extern "C" fn entry() -> ! {
+extern "C" fn entry(initial_sp: *const usize) -> ! {
+    // SAFETY: `initial_sp` is the exact `rsp` handed to `_start` by Linux.
+    let env = unsafe { Env::from_initial_sp(initial_sp) };
+    let port = env
+        .get_u64(b"PORT")
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(DEFAULT_PORT);
+    let log_path = env.get(b"LOG_PATH").unwrap_or(DEFAULT_LOG_PATH);
+    let keepalive_secs = env
+        .get_u64(b"KEEPALIVE_SECS")
+        .map(|s| s as i64)
+        .unwrap_or(DEFAULT_KEEPALIVE_SECS);
+
     // SAFETY: Single-threaded program; `entry` is called once and owns both statics exclusively.
     let clients = unsafe { &mut *core::ptr::addr_of_mut!(CLIENTS) };
     let store = unsafe { &mut *core::ptr::addr_of_mut!(STORE) };
-    let disk = DiskLog::open_default(store);
+    let disk = DiskLog::open_and_load(log_path, store);
 
     let listener = socket_with(
         AddressFamily::INET,
@@ -100,7 +116,7 @@ extern "C" fn entry() -> ! {
 
     let _ = sockopt::set_socket_reuseaddr(&listener, true);
 
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080);
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     if bind(&listener, &addr).is_err() || listen(&listener, 16).is_err() {
         exit(1);
     }
@@ -111,15 +127,18 @@ extern "C" fn entry() -> ! {
         exit(1);
     }
 
+    let mut banner = [0u8; 64];
+    let mut bw = BufWriter::new(&mut banner);
+    bw.push_bytes(b"Listening on http://0.0.0.0:");
+    bw.push_u64(port as u64);
+    bw.push_byte(b'\n');
+    let banner_len = bw.len;
     // SAFETY: Single-threaded; FD 1 (stdout) is valid and never closed by us.
-    let _ = io::write(
-        unsafe { rustix::stdio::stdout() },
-        b"Listening on http://0.0.0.0:8080\n",
-    );
+    let _ = io::write(unsafe { rustix::stdio::stdout() }, &banner[..banner_len]);
 
     let mut events = [MaybeUninit::<Event>::uninit(); MAX_CLIENTS];
     let keepalive = Timespec {
-        tv_sec: 30,
+        tv_sec: keepalive_secs,
         tv_nsec: 0,
     };
 
