@@ -33,10 +33,9 @@ pub const JSON_BUF_SIZE: usize = 640;
 /// Number of recent notifications kept in the in-memory ring buffer.
 pub const MAX_HISTORY: usize = 64;
 
-/// Maximum distinct interned topics in the topic table.
-pub const MAX_TOPICS: usize = 16;
-
 /// Maximum byte lengths for notification fields (all clean powers of 2).
 pub const MAX_TOPIC: usize = 32;
 pub const MAX_TITLE: usize = 64;
 pub const MAX_BODY: usize = 128;
+
+const _: () = assert!(MAX_TOPIC <= 255 && MAX_TITLE <= 255 && MAX_BODY <= 255);

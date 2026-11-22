@@ -107,23 +107,23 @@ impl DiskLog {
     }
 
     /// Appends one notification record to disk using a single stack buffer & write.
-    pub fn append(&self, notif: &Notification, topic: &[u8]) {
+    pub fn append(&self, notif: &Notification) {
         let Some(fd) = self.fd.as_ref() else { return };
 
-        let tlen = topic.len().min(MAX_TOPIC);
+        let topic = notif.topic();
         let title = notif.title();
         let body = notif.body();
 
         let mut rec = [0u8; MAX_RECORD_LEN];
         rec[0..8].copy_from_slice(&notif.timestamp.to_le_bytes());
         rec[8] = notif.priority;
-        rec[9] = tlen as u8;
+        rec[9] = topic.len() as u8;
         rec[10] = title.len() as u8;
         rec[11] = body.len() as u8;
 
         let mut pos = HEADER_LEN;
-        rec[pos..pos + tlen].copy_from_slice(&topic[..tlen]);
-        pos += tlen;
+        rec[pos..pos + topic.len()].copy_from_slice(topic);
+        pos += topic.len();
         rec[pos..pos + title.len()].copy_from_slice(title);
         pos += title.len();
         rec[pos..pos + body.len()].copy_from_slice(body);

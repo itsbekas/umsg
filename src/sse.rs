@@ -33,10 +33,9 @@ pub fn close_sse_client(epfd: &OwnedFd, client: &mut SseClient) {
 pub fn send_sse_event(
     fd: impl AsFd,
     notif: &Notification,
-    topic_name: &[u8],
     json_buf: &mut [u8; JSON_BUF_SIZE],
 ) -> bool {
-    let len = notif.format_json(topic_name, json_buf);
+    let len = notif.format_json(json_buf);
     send_sse_frame(fd, notif.id, &json_buf[..len])
 }
 

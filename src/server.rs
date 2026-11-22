@@ -42,7 +42,6 @@ enum Action {
     Health,
     BadRequest,
     NotFound,
-    TopicLimit,
     Unauthorized,
 }
 
@@ -204,9 +203,9 @@ pub fn handle_client_read(
 
             if ok && replay_history {
                 let fd = http_clients[slot].fd.as_ref().unwrap();
-                store.for_each_oldest_first(|notif, topic_name| {
+                store.for_each_oldest_first(|notif| {
                     if ok && notif.id > last_event_id {
-                        ok = send_sse_event(fd, notif, topic_name, &mut json_buf);
+                        ok = send_sse_event(fd, notif, &mut json_buf);
                     }
                 });
             }
@@ -279,17 +278,6 @@ pub fn handle_client_read(
         Action::NotFound => {
             if let Some(fd) = http_clients[slot].fd.as_ref() {
                 send_http_status(fd, b"404 Not Found", b"text/plain", b"not found\n");
-            }
-            close_http_client(epfd, &mut http_clients[slot]);
-        }
-        Action::TopicLimit => {
-            if let Some(fd) = http_clients[slot].fd.as_ref() {
-                send_http_status(
-                    fd,
-                    b"507 Insufficient Storage",
-                    b"text/plain",
-                    b"topic limit reached\n",
-                );
             }
             close_http_client(epfd, &mut http_clients[slot]);
         }
@@ -377,12 +365,13 @@ fn handle_post(
 
     if req.ephemeral {
         // Ephemeral message (e.g. 2FA code): broadcast live to /<topic> ONLY,
-        // never stored in ring buffer, never written to disk, never interns a topic slot,
-        // and never sent to /all.
+        // never stored in ring buffer, never written to disk, and never sent to /all.
         let mut tmp = Notification::EMPTY;
         tmp.id = 0;
         tmp.timestamp = ts;
         tmp.priority = req.priority;
+        tmp.topic[..topic.len()].copy_from_slice(topic);
+        tmp.topic_len = topic.len() as u8;
         let title = truncate_utf8(req.title, MAX_TITLE);
         tmp.title[..title.len()].copy_from_slice(title);
         tmp.title_len = title.len() as u8;
@@ -392,21 +381,14 @@ fn handle_post(
 
         *broadcast_id = 0;
         *broadcast_topic_only = true;
-        *broadcast_len = tmp.format_json(topic, json_buf);
+        *broadcast_len = tmp.format_json(json_buf);
         return Action::PostOk;
     }
 
-    if let Some(notif) = store
-        .push(ts, topic, req.title, req.priority, req.body)
-        .copied()
-    {
-        let topic_name = store.topic_name(notif.topic_id);
-        disk.append(&notif, topic_name);
-        *broadcast_id = notif.id;
-        *broadcast_topic_only = false;
-        *broadcast_len = notif.format_json(topic_name, json_buf);
-        Action::PostOk
-    } else {
-        Action::TopicLimit
-    }
+    let notif = *store.push(ts, topic, req.title, req.priority, req.body);
+    disk.append(&notif);
+    *broadcast_id = notif.id;
+    *broadcast_topic_only = false;
+    *broadcast_len = notif.format_json(json_buf);
+    Action::PostOk
 }
