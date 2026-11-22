@@ -104,7 +104,7 @@ impl Store {
     };
 
     /// Returns the 1-byte ID for `name`, inserting it into the topic table if new.
-    fn intern_topic(&mut self, name: &[u8]) -> u8 {
+    pub fn intern_topic(&mut self, name: &[u8]) -> u8 {
         let len = name.len().min(MAX_TOPIC);
         let trimmed = &name[..len];
 

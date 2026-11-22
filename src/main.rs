@@ -18,7 +18,7 @@ use rustix::net::{
     AddressFamily, SendFlags, SocketAddrV4, SocketFlags, SocketType, accept_with, bind, listen,
     send, socket_with, sockopt,
 };
-use rustix::time::{ClockId, clock_gettime};
+use rustix::time::{ClockId, Timespec, clock_gettime};
 
 use disk::DiskLog;
 use fmt::BufWriter;
@@ -37,6 +37,7 @@ const LISTENER_TAG: u64 = u64::MAX;
 struct Client {
     fd: Option<OwnedFd>,
     is_sse: bool,
+    sub_topic: Option<u8>, // None = all topics (/all), Some(id) = single topic (/<topic>)
     read_len: usize,
     read_buf: [u8; READ_BUF_SIZE],
 }
@@ -45,6 +46,7 @@ impl Client {
     const EMPTY: Self = Self {
         fd: None,
         is_sse: false,
+        sub_topic: None,
         read_len: 0,
         read_buf: [0; READ_BUF_SIZE],
     };
@@ -86,7 +88,7 @@ extern "C" fn entry() -> ! {
     // SAFETY: Single-threaded program; `entry` is called once and owns both statics exclusively.
     let clients = unsafe { &mut *core::ptr::addr_of_mut!(CLIENTS) };
     let store = unsafe { &mut *core::ptr::addr_of_mut!(STORE) };
-    let disk = DiskLog::open_and_load(c"notifications.log", store);
+    let disk = DiskLog::open_default(store);
 
     let listener = socket_with(
         AddressFamily::INET,
@@ -98,7 +100,7 @@ extern "C" fn entry() -> ! {
 
     let _ = sockopt::set_socket_reuseaddr(&listener, true);
 
-    let addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080);
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080);
     if bind(&listener, &addr).is_err() || listen(&listener, 16).is_err() {
         exit(1);
     }
@@ -112,15 +114,25 @@ extern "C" fn entry() -> ! {
     // SAFETY: Single-threaded; FD 1 (stdout) is valid and never closed by us.
     let _ = io::write(
         unsafe { rustix::stdio::stdout() },
-        b"Listening on http://127.0.0.1:8080\n",
+        b"Listening on http://0.0.0.0:8080\n",
     );
 
     let mut events = [MaybeUninit::<Event>::uninit(); MAX_CLIENTS];
+    let keepalive = Timespec {
+        tv_sec: 30,
+        tv_nsec: 0,
+    };
 
     loop {
-        let Ok((ready, _)) = epoll::wait(&epfd, &mut events, None) else {
+        let Ok((ready, _)) = epoll::wait(&epfd, &mut events, Some(&keepalive)) else {
             continue;
         };
+
+        // 30s idle timeout: send SSE comment ping so Cloudflare Tunnel keeps tabs alive
+        if ready.is_empty() {
+            send_sse_keepalive(&epfd, clients);
+            continue;
+        }
 
         for ev in ready {
             let tag = ev.data.u64();
@@ -160,6 +172,7 @@ fn accept_new_clients(epfd: &OwnedFd, listener: &OwnedFd, clients: &mut [Client;
                 {
                     client.fd = Some(fd);
                     client.is_sse = false;
+                    client.sub_topic = None;
                     client.read_len = 0;
                 }
                 break;
@@ -173,6 +186,7 @@ fn close_client(epfd: &OwnedFd, client: &mut Client) {
         let _ = epoll::delete(epfd, &fd);
     }
     client.is_sse = false;
+    client.sub_topic = None;
     client.read_len = 0;
 }
 
@@ -227,6 +241,9 @@ fn handle_client_read(
     let mut json_buf = [0u8; JSON_BUF_SIZE];
     let mut broadcast_len: usize = 0;
     let mut broadcast_id: u64 = 0;
+    let mut broadcast_topic_id: u8 = 0;
+    let mut sub_topic: Option<u8> = None;
+    let mut replay_history = false;
     let mut last_event_id: u64 = 0;
 
     let action = {
@@ -235,9 +252,23 @@ fn handle_client_read(
             ParseStatus::Incomplete => return,
             ParseStatus::Invalid => 0u8, // close
             ParseStatus::Complete(req) => match (req.method, req.path) {
-                (Method::Get, b"/events") => {
+                (Method::Get, b"/") => 3u8,
+                (Method::Get, b"/health") => 4u8,
+                (Method::Get, b"/all") => {
                     last_event_id = req.last_event_id;
+                    sub_topic = None;
+                    replay_history = true;
                     1u8
+                }
+                (Method::Get, path) => {
+                    let topic = path.strip_prefix(b"/").unwrap_or(path);
+                    if topic.is_empty() {
+                        3u8
+                    } else {
+                        sub_topic = Some(store.intern_topic(topic));
+                        replay_history = false; // live-only (safe for 2FA tokens!)
+                        1u8
+                    }
                 }
                 (Method::Post, path) => {
                     let topic = path.strip_prefix(b"/").unwrap_or(path);
@@ -247,10 +278,10 @@ fn handle_client_read(
                     let topic_name = store.topic_name(notif.topic_id);
                     disk.append(&notif, topic_name);
                     broadcast_id = notif.id;
+                    broadcast_topic_id = notif.topic_id;
                     broadcast_len = notif.format_json(topic_name, &mut json_buf);
                     2u8
                 }
-                (Method::Get, b"/") => 3u8,
                 _ => 4u8,
             },
         }
@@ -258,7 +289,7 @@ fn handle_client_read(
 
     match action {
         1 => {
-            // Upgrade connection to live SSE stream and replay missed history
+            // Upgrade connection to live SSE stream
             let sse_headers = b"HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Cache-Control: no-cache\r\n\
@@ -269,7 +300,7 @@ fn handle_client_read(
                 .as_ref()
                 .is_some_and(|fd| send_all(fd, sse_headers));
 
-            if ok {
+            if ok && replay_history {
                 let fd = clients[slot].fd.as_ref().unwrap();
                 store.for_each_oldest_first(|notif, topic_name| {
                     if ok && notif.id > last_event_id {
@@ -280,6 +311,7 @@ fn handle_client_read(
 
             if ok {
                 clients[slot].is_sse = true;
+                clients[slot].sub_topic = sub_topic;
                 clients[slot].read_len = 0;
             } else {
                 close_client(epfd, &mut clients[slot]);
@@ -292,8 +324,14 @@ fn handle_client_read(
             }
             close_client(epfd, &mut clients[slot]);
 
-            // Broadcast to all live SSE subscribers
-            broadcast_sse_json(epfd, clients, broadcast_id, &json_buf[..broadcast_len]);
+            // Broadcast to /all subscribers and matching /<topic> subscribers
+            broadcast_sse_json(
+                epfd,
+                clients,
+                broadcast_id,
+                broadcast_topic_id,
+                &json_buf[..broadcast_len],
+            );
         }
         3 => {
             // Serve the embedded web UI
@@ -348,14 +386,29 @@ fn send_sse_frame(fd: impl AsFd, id: u64, json: &[u8]) -> bool {
     send_all(&fd, &prefix[..prefix_len]) && send_all(&fd, json) && send_all(&fd, b"\n\n")
 }
 
+fn send_sse_keepalive(epfd: &OwnedFd, clients: &mut [Client; MAX_CLIENTS]) {
+    for client in clients.iter_mut() {
+        if client.is_sse {
+            let ok = client
+                .fd
+                .as_ref()
+                .is_some_and(|fd| send_all(fd, b": ping\n\n"));
+            if !ok {
+                close_client(epfd, client);
+            }
+        }
+    }
+}
+
 fn broadcast_sse_json(
     epfd: &OwnedFd,
     clients: &mut [Client; MAX_CLIENTS],
     id: u64,
+    topic_id: u8,
     json: &[u8],
 ) {
     for client in clients.iter_mut() {
-        if client.is_sse {
+        if client.is_sse && client.sub_topic.is_none_or(|t| t == topic_id) {
             let ok = client
                 .fd
                 .as_ref()

@@ -29,6 +29,17 @@ pub struct DiskLog {
 }
 
 impl DiskLog {
+    /// Tries `/data/notifications.log` first (for Docker volume mounts),
+    /// falling back to `notifications.log` in the current working directory.
+    pub fn open_default(store: &mut Store) -> Self {
+        let log = Self::open_and_load(c"/data/notifications.log", store);
+        if log.fd.is_some() {
+            log
+        } else {
+            Self::open_and_load(c"notifications.log", store)
+        }
+    }
+
     /// Opens (or creates) `path` for reading & appending, and replays any
     /// existing records into `store`.
     pub fn open_and_load(path: &CStr, store: &mut Store) -> Self {

@@ -92,7 +92,7 @@ function renderList() {
     </div>`).join('');
 }
 
-const es = new EventSource('/events');
+const es = new EventSource('/all');
 es.onopen = () => { dot.className = 'dot ok'; setTimeout(() => { ready = true; }, 300); };
 es.onerror = () => { dot.className = 'dot err'; };
 es.onmessage = e => {
