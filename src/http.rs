@@ -1,8 +1,14 @@
-//! Zero-allocation HTTP/1.1 request parser.
+//! Zero-allocation HTTP/1.1 request parser & response writer.
 //!
 //! Instead of allocating `String`s or `HashMap`s for headers, every field in
 //! `Request<'a>` is just a borrowed slice (`&'a [u8]`) pointing directly into
 //! the client's existing `read_buf`.
+
+use rustix::fd::AsFd;
+use rustix::io::Errno;
+use rustix::net::{SendFlags, send};
+
+use crate::fmt::BufWriter;
 
 #[derive(Copy, Clone)]
 pub enum Method {
@@ -223,4 +229,51 @@ fn parse_usize(s: &[u8]) -> Option<usize> {
         acc = acc.checked_mul(10)?.checked_add((b - b'0') as usize)?;
     }
     Some(acc)
+}
+
+/// Constant-time byte slice comparison (does not short-circuit on mismatch).
+pub fn const_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= core::hint::black_box(a[i] ^ b[i]);
+    }
+    core::hint::black_box(diff) == 0
+}
+
+pub fn send_http_status(fd: impl AsFd, status: &[u8], content_type: &[u8], body: &[u8]) {
+    let mut hdr = [0u8; 384];
+    let mut w = BufWriter::new(&mut hdr);
+    w.push_bytes(b"HTTP/1.1 ");
+    w.push_bytes(status);
+    w.push_bytes(b"\r\nContent-Type: ");
+    w.push_bytes(content_type);
+    w.push_bytes(b"\r\nContent-Length: ");
+    w.push_u64(body.len() as u64);
+    w.push_bytes(
+        b"\r\nX-Content-Type-Options: nosniff\r\n\
+        X-Frame-Options: DENY\r\n\
+        Referrer-Policy: no-referrer\r\n\
+        Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:\r\n\
+        Connection: close\r\n\r\n",
+    );
+    let hdr_len = w.len;
+
+    if send_all(&fd, &hdr[..hdr_len]) {
+        let _ = send_all(&fd, body);
+    }
+}
+
+pub fn send_all(fd: impl AsFd, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        match send(&fd, buf, SendFlags::NOSIGNAL) {
+            Ok(0) => return false,
+            Ok(n) => buf = &buf[n..],
+            Err(Errno::INTR) => continue,
+            Err(_) => return false,
+        }
+    }
+    true
 }
