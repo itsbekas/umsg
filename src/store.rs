@@ -100,7 +100,7 @@ pub fn is_valid_topic(name: &[u8]) -> bool {
 }
 
 /// Truncates `s` to at most `max` bytes without splitting a multi-byte UTF-8 sequence.
-fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
+pub fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
     if s.len() <= max {
         return s;
     }
@@ -126,7 +126,7 @@ impl Store {
 
     /// Returns the 1-byte ID for `name`, inserting it into the topic table if new.
     /// Returns `None` if the topic table is full (never aliases to slot 0).
-    pub fn intern_topic(&mut self, name: &[u8]) -> Option<u8> {
+    fn intern_topic(&mut self, name: &[u8]) -> Option<u8> {
         let trimmed = truncate_utf8(name, MAX_TOPIC);
 
         for i in 0..self.topic_count {

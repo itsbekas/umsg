@@ -23,14 +23,14 @@ use rustix::net::{
 use rustix::time::{ClockId, Timespec, clock_gettime};
 
 use config::{
-    DEFAULT_KEEPALIVE_SECS, DEFAULT_LOG_PATH, DEFAULT_PORT, JSON_BUF_SIZE, MAX_CLIENTS,
-    READ_BUF_SIZE, READ_TIMEOUT_SECS,
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_LOG_PATH, DEFAULT_PORT, JSON_BUF_SIZE, MAX_BODY, MAX_CLIENTS,
+    MAX_TITLE, MAX_TOPIC, READ_BUF_SIZE, READ_TIMEOUT_SECS,
 };
 use disk::DiskLog;
 use env::Env;
 use fmt::BufWriter;
 use http::{Method, ParseStatus, parse_request};
-use store::{Notification, Store, is_valid_topic};
+use store::{Notification, Store, is_valid_topic, truncate_utf8};
 
 /// Embedded directly in `.rodata` — 1 memory page (4 KB), only paged in when requested.
 const INDEX_HTML: &[u8] = include_bytes!("index.html");
@@ -40,8 +40,10 @@ const LISTENER_TAG: u64 = u64::MAX;
 struct Client {
     fd: Option<OwnedFd>,
     is_sse: bool,
-    sub_topic: Option<u8>, // None = all topics (/all), Some(id) = single topic (/<topic>)
-    last_activity: i64,    // Monotonic seconds for Slowloris read timeout
+    /// When `is_sse == true`: `0` means subscribed to `/all`; `> 0` means subscribed
+    /// to `&read_buf[..sub_topic_len]` (reusing the idle read buffer for 0 extra RAM!).
+    sub_topic_len: u8,
+    connected_at: i64, // Monotonic seconds for total non-SSE request deadline
     read_len: usize,
     read_buf: [u8; READ_BUF_SIZE],
 }
@@ -50,8 +52,8 @@ impl Client {
     const EMPTY: Self = Self {
         fd: None,
         is_sse: false,
-        sub_topic: None,
-        last_activity: 0,
+        sub_topic_len: 0,
+        connected_at: 0,
         read_len: 0,
         read_buf: [0; READ_BUF_SIZE],
     };
@@ -168,17 +170,17 @@ extern "C" fn entry(initial_sp: *const usize) -> ! {
                     if flags.intersects(EventFlags::ERR | EventFlags::HUP | EventFlags::RDHUP) {
                         close_client(&epfd, &mut clients[slot]);
                     } else if flags.contains(EventFlags::IN) {
-                        handle_client_read(&epfd, clients, store, &disk, auth_token, slot, now);
+                        handle_client_read(&epfd, clients, store, &disk, auth_token, slot);
                     }
                 }
             }
         }
 
-        // Reap idle non-SSE connections (Slowloris protection)
+        // Reap slow/idle non-SSE connections (hard deadline defeats trickle Slowloris)
         for client in clients.iter_mut() {
             if client.fd.is_some()
                 && !client.is_sse
-                && now.saturating_sub(client.last_activity) >= READ_TIMEOUT_SECS
+                && now.saturating_sub(client.connected_at) >= READ_TIMEOUT_SECS
             {
                 close_client(&epfd, client);
             }
@@ -219,8 +221,8 @@ fn accept_new_clients(
                 {
                     client.fd = Some(fd);
                     client.is_sse = false;
-                    client.sub_topic = None;
-                    client.last_activity = now;
+                    client.sub_topic_len = 0;
+                    client.connected_at = now;
                     client.read_len = 0;
                 }
                 break;
@@ -234,7 +236,7 @@ fn close_client(epfd: &OwnedFd, client: &mut Client) {
         let _ = epoll::delete(epfd, &fd);
     }
     client.is_sse = false;
-    client.sub_topic = None;
+    client.sub_topic_len = 0;
     client.read_len = 0;
 }
 
@@ -245,7 +247,6 @@ fn handle_client_read(
     disk: &DiskLog,
     auth_token: Option<&[u8]>,
     slot: usize,
-    now: i64,
 ) {
     if clients[slot].is_sse {
         let mut tmp = [0u8; 64];
@@ -286,15 +287,14 @@ fn handle_client_read(
     };
 
     clients[slot].read_len += n;
-    clients[slot].last_activity = now;
 
     // Parse the HTTP request in-place from read_buf (zero allocations!)
     let mut json_buf = [0u8; JSON_BUF_SIZE];
     let mut broadcast_len: usize = 0;
     let mut broadcast_id: u64 = 0;
-    let mut broadcast_topic_id: u8 = 0;
+    let mut topic_buf = [0u8; MAX_TOPIC];
+    let mut topic_len: usize = 0;
     let mut broadcast_topic_only = false;
-    let mut sub_topic: Option<u8> = None;
     let mut replay_history = false;
     let mut last_event_id: u64 = 0;
 
@@ -308,7 +308,7 @@ fn handle_client_read(
                 (Method::Get, b"/health") => 4u8,
                 (Method::Get, b"/all") => {
                     last_event_id = req.last_event_id;
-                    sub_topic = None;
+                    topic_len = 0;
                     replay_history = true;
                     1u8
                 }
@@ -316,12 +316,12 @@ fn handle_client_read(
                     let topic = path.strip_prefix(b"/").unwrap_or(path);
                     if !is_valid_topic(topic) {
                         6u8 // 404 Not Found (e.g. /favicon.ico, invalid chars)
-                    } else if let Some(tid) = store.intern_topic(topic) {
-                        sub_topic = Some(tid);
+                    } else {
+                        // Store topic name without touching Store's topic table!
+                        topic_buf[..topic.len()].copy_from_slice(topic);
+                        topic_len = topic.len();
                         replay_history = false; // live-only (safe for ephemeral tokens)
                         1u8
-                    } else {
-                        7u8 // 507 Insufficient Storage (topic table full)
                     }
                 }
                 (Method::Post, path) => {
@@ -337,7 +337,8 @@ fn handle_client_read(
                                 &req,
                                 &mut json_buf,
                                 &mut broadcast_id,
-                                &mut broadcast_topic_id,
+                                &mut topic_buf,
+                                &mut topic_len,
                                 &mut broadcast_len,
                                 &mut broadcast_topic_only,
                             )
@@ -350,7 +351,8 @@ fn handle_client_read(
                             &req,
                             &mut json_buf,
                             &mut broadcast_id,
-                            &mut broadcast_topic_id,
+                            &mut topic_buf,
+                            &mut topic_len,
                             &mut broadcast_len,
                             &mut broadcast_topic_only,
                         )
@@ -386,7 +388,10 @@ fn handle_client_read(
 
             if ok {
                 clients[slot].is_sse = true;
-                clients[slot].sub_topic = sub_topic;
+                clients[slot].sub_topic_len = topic_len as u8;
+                if topic_len > 0 {
+                    clients[slot].read_buf[..topic_len].copy_from_slice(&topic_buf[..topic_len]);
+                }
                 clients[slot].read_len = 0;
             } else {
                 close_client(epfd, &mut clients[slot]);
@@ -409,7 +414,7 @@ fn handle_client_read(
                 epfd,
                 clients,
                 broadcast_id,
-                broadcast_topic_id,
+                &topic_buf[..topic_len],
                 broadcast_topic_only,
                 &json_buf[..broadcast_len],
             );
@@ -468,7 +473,8 @@ fn handle_post(
     req: &http::Request<'_>,
     json_buf: &mut [u8; JSON_BUF_SIZE],
     broadcast_id: &mut u64,
-    broadcast_topic_id: &mut u8,
+    topic_buf: &mut [u8; MAX_TOPIC],
+    topic_len: &mut usize,
     broadcast_len: &mut usize,
     broadcast_topic_only: &mut bool,
 ) -> u8 {
@@ -478,30 +484,29 @@ fn handle_post(
         return 5; // 400 Bad Request
     }
 
+    topic_buf[..topic.len()].copy_from_slice(topic);
+    *topic_len = topic.len();
+
     let ts = clock_gettime(ClockId::Realtime).tv_sec;
 
     if req.ephemeral {
         // Ephemeral message (e.g. 2FA code): broadcast live to /<topic> ONLY,
-        // never stored in ring buffer, never written to disk, never sent to /all.
-        let Some(tid) = store.intern_topic(topic) else {
-            return 7; // 507 Insufficient Storage
-        };
+        // never stored in ring buffer, never written to disk, never interns a topic slot,
+        // and never sent to /all.
         let mut tmp = Notification::EMPTY;
         tmp.id = 0;
         tmp.timestamp = ts;
         tmp.priority = req.priority;
-        tmp.topic_id = tid;
-        let tlen = req.title.len().min(config::MAX_TITLE);
-        tmp.title[..tlen].copy_from_slice(&req.title[..tlen]);
-        tmp.title_len = tlen as u8;
-        let blen = req.body.len().min(config::MAX_BODY);
-        tmp.body[..blen].copy_from_slice(&req.body[..blen]);
-        tmp.body_len = blen as u8;
+        let title = truncate_utf8(req.title, MAX_TITLE);
+        tmp.title[..title.len()].copy_from_slice(title);
+        tmp.title_len = title.len() as u8;
+        let body = truncate_utf8(req.body, MAX_BODY);
+        tmp.body[..body.len()].copy_from_slice(body);
+        tmp.body_len = body.len() as u8;
 
         *broadcast_id = 0;
-        *broadcast_topic_id = tid;
         *broadcast_topic_only = true;
-        *broadcast_len = tmp.format_json(store.topic_name(tid), json_buf);
+        *broadcast_len = tmp.format_json(topic, json_buf);
         return 2;
     }
 
@@ -512,7 +517,6 @@ fn handle_post(
         let topic_name = store.topic_name(notif.topic_id);
         disk.append(&notif, topic_name);
         *broadcast_id = notif.id;
-        *broadcast_topic_id = notif.topic_id;
         *broadcast_topic_only = false;
         *broadcast_len = notif.format_json(topic_name, json_buf);
         2
@@ -595,14 +599,15 @@ fn broadcast_sse_json(
     epfd: &OwnedFd,
     clients: &mut [Client; MAX_CLIENTS],
     id: u64,
-    topic_id: u8,
+    topic: &[u8],
     topic_only: bool,
     json: &[u8],
 ) {
     for client in clients.iter_mut() {
-        let matches = match client.sub_topic {
-            Some(t) => t == topic_id,
-            None => !topic_only,
+        let matches = if client.sub_topic_len == 0 {
+            !topic_only
+        } else {
+            &client.read_buf[..client.sub_topic_len as usize] == topic
         };
         if client.is_sse && matches {
             let ok = client
