@@ -1,4 +1,4 @@
-name: Build & Deploy
+name: Build & Push Image
 
 on:
   push:
@@ -25,12 +25,3 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/itsbekas/umsg:latest
-
-  deploy:
-    needs: build
-    uses: itsbekas/homelab/.github/workflows/trigger-watchtower.yml@master
-    with:
-      image: ghcr.io/itsbekas/umsg
-    secrets:
-      url: ${{ secrets.WATCHTOWER_URL }}
-      token: ${{ secrets.WATCHTOWER_TOKEN }}
