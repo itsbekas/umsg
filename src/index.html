@@ -1,132 +1,47 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" href="data:,">
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon href=data:,>
 <title>μmsg</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font: 14px/1.5 system-ui, -apple-system, sans-serif;
-    background: #0d1117; color: #e6edf3;
-    max-width: 720px; margin: 0 auto; padding: 20px 16px;
-  }
-  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
-  h1 { font-size: 18px; display: flex; align-items: center; gap: 8px; letter-spacing: -.01em; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #d29922; display: inline-block; }
-  .dot.ok { background: #3fb950; }
-  .dot.err { background: #f85149; }
-  button {
-    background: #21262d; color: #e6edf3; border: 1px solid #30363d;
-    border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 13px; cursor: pointer;
-  }
-  button:hover { background: #30363d; }
-  button.active { background: #1f6feb; border-color: #388bfd; }
-  #topics { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
-  #list { display: flex; flex-direction: column; gap: 10px; }
-  .card {
-    background: #161b22; border: 1px solid #30363d; border-left: 4px solid #30363d;
-    border-radius: 8px; padding: 12px 14px;
-  }
-  .p1, .p2 { opacity: .8; }
-  .p4 { border-left-color: #d29922; }
-  .p5 { border-left-color: #f85149; }
-  .meta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: #8b949e; margin-bottom: 4px; }
-  .tag { background: #21262d; color: #79c0ff; padding: 1px 8px; border-radius: 99px; font-weight: 600; }
-  .title { font-weight: 600; margin-bottom: 2px; }
-  .msg { white-space: pre-wrap; word-break: break-word; color: #c9d1d9; }
-  .empty { color: #8b949e; text-align: center; padding: 40px 0; }
+:root{color-scheme:dark}
+body{font:14px/1.5 system-ui;max-width:680px;margin:24px auto;padding:0 16px}
+header,#topics{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:14px}
+h1{font-size:18px;margin:0 auto 0 0}
+#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#d29922;margin-right:8px}
+#dot.ok{background:#3fb950}
+#dot.err{background:#f85149}
+button{font:inherit;padding:4px 10px;border-radius:6px;border:1px solid #444;background:#222;color:inherit;cursor:pointer}
+button.on{background:#1f6feb;border-color:#388bfd}
+.c{border:1px solid #333;border-left:4px solid #333;border-radius:6px;padding:10px 12px;margin-bottom:8px}
+.p1,.p2{opacity:.7}
+.p4{border-left-color:#d29922}
+.p5{border-left-color:#f85149}
+.m{font-size:12px;opacity:.7;display:flex;justify-content:space-between;margin-bottom:4px}
+.b{white-space:pre-wrap;word-break:break-word}
 </style>
-</head>
-<body>
-<header>
-  <h1><span id="dot" class="dot"></span>μmsg</h1>
-  <button id="perm" hidden>Enable Desktop Alerts</button>
-</header>
-<div id="topics"></div>
-<div id="list"><div class="empty">Waiting for messages...</div></div>
+<header><h1><span id=dot></span>μmsg</h1><button id=perm hidden>Alerts</button></header>
+<div id=topics></div>
+<div id=list>Waiting...</div>
 <script>
-const list = document.getElementById('list');
-const topicsEl = document.getElementById('topics');
-const dot = document.getElementById('dot');
-const permBtn = document.getElementById('perm');
-const items = [];
-const topics = new Set();
-let filter = '';
-let ready = false;
-
-if ('Notification' in window && Notification.permission === 'default') {
-  permBtn.hidden = false;
-  permBtn.addEventListener('click', async () => {
-    await Notification.requestPermission();
-    permBtn.hidden = Notification.permission !== 'default';
-  });
+let a=[],tags=new Set(),f="",ready=0,N=window.Notification;
+if(N&&N.permission=="default"){perm.hidden=0;perm.onclick=()=>N.requestPermission().then(p=>perm.hidden=p!="default")}
+let esc=s=>String(s??"").replace(/[&<>"]/g,c=>"&#"+c.charCodeAt(0)+";");
+topics.onclick=e=>{if(e.target.tagName=="BUTTON"){f=e.target.dataset.t;r()}};
+function r(){
+topics.innerHTML=tags.size?["",...tags].map(t=>`<button class="${f==t?"on":""}" data-t="${esc(t)}">${esc(t||"All")}</button>`).join(""):"";
+let s=f?a.filter(n=>n.topic==f):a;
+list.innerHTML=s.length?s.map(n=>{let p=n.priority>=1&&n.priority<=5?n.priority|0:3;return`<div class="c p${p}"><div class=m><b>${esc(n.topic)}</b><span>${new Date(n.ts*1000).toLocaleString()}</span></div>${n.title?`<div><b>${esc(n.title)}</b></div>`:""}<div class=b>${esc(n.msg)}</div></div>`}).join(""):"No messages yet.";
 }
-
-function el(tag, cls, text) {
-  const node = document.createElement(tag);
-  if (cls) node.className = cls;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function setFilter(t) {
-  filter = t;
-  renderTopics();
-  renderList();
-}
-
-function renderTopics() {
-  topicsEl.replaceChildren();
-  if (!topics.size) return;
-  const makeBtn = (label, value) => {
-    const btn = el('button', filter === value ? 'active' : '', label);
-    btn.addEventListener('click', () => setFilter(value));
-    topicsEl.appendChild(btn);
-  };
-  makeBtn('All', '');
-  for (const t of topics) makeBtn(t, t);
-}
-
-function renderList() {
-  list.replaceChildren();
-  const shown = filter ? items.filter(n => n.topic === filter) : items;
-  if (!shown.length) {
-    list.appendChild(el('div', 'empty', 'No messages yet.'));
-    return;
-  }
-  for (const n of shown) {
-    const p = Number.isInteger(n.priority) && n.priority >= 1 && n.priority <= 5 ? n.priority : 3;
-    const card = el('div', `card p${p}`);
-    const meta = el('div', 'meta');
-    meta.appendChild(el('span', 'tag', String(n.topic || '')));
-    const dt = new Date(n.ts * 1000);
-    meta.appendChild(el('span', '', dt.toLocaleString()));
-    card.appendChild(meta);
-    if (n.title) card.appendChild(el('div', 'title', String(n.title)));
-    card.appendChild(el('div', 'msg', String(n.msg || '')));
-    list.appendChild(card);
-  }
-}
-
-const es = new EventSource('/all');
-es.onopen = () => { dot.className = 'dot ok'; setTimeout(() => { ready = true; }, 300); };
-es.onerror = () => { dot.className = 'dot err'; };
-es.onmessage = e => {
-  let n;
-  try { n = JSON.parse(e.data); } catch { return; }
-  if (items.some(x => x.id === n.id)) return;
-  items.unshift(n);
-  if (items.length > 64) items.pop();
-  if (n.topic) topics.add(n.topic);
-  renderTopics();
-  renderList();
-  if (ready && 'Notification' in window && Notification.permission === 'granted') {
-    new Notification(n.title || n.topic, { body: n.msg });
-  }
+let es=new EventSource("/all");
+es.onopen=()=>{dot.className="ok";setTimeout(()=>ready=1,300)};
+es.onerror=()=>dot.className="err";
+es.onmessage=e=>{
+let n;try{n=JSON.parse(e.data)}catch{return}
+if(a.some(x=>x.id==n.id))return;
+a.unshift(n);if(a.length>64)a.pop();
+if(n.topic)tags.add(n.topic);
+r();
+if(ready&&N&&N.permission=="granted")new N(n.title||n.topic,{body:n.msg});
 };
 </script>
-</body>
-</html>
